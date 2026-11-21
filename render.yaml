@@ -1,0 +1,12 @@
+# تنظیمات دیپلوی روی Render — لایه‌ی Node با IP متفاوت از Cloudflare
+# دکمه‌ی Deploy to Render: https://render.com/deploy?repo=https://github.com/freerouter11/web-proxy-deploy
+services:
+  - type: web
+    name: web-proxy
+    runtime: node
+    plan: free
+    region: frankfurt
+    buildCommand: npm install
+    startCommand: node server.js
+    healthCheckPath: /health
+    autoDeploy: true

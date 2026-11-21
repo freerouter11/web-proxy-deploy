@@ -1,17 +1,17 @@
 #!/usr/bin/env node
 /**
- * وب‌پروکسی شخصی — نسخه Node.js (۲)
+ * وب‌پروکسی شخصی — نسخه Node.js (۳)
  *
  * مرورگر پروکسی حرفه‌ای با همان قابلیت‌های نسخه‌ی Cloudflare:
- * تب‌ها، تاریخچه، نشانک‌ها، سوییچ سرور، پشتیبانی یوتیوب (HLS)
- * و کش درون‌حافظه‌ای برای سرعت.
+ * تب‌ها، تاریخچه، نشانک‌ها، سوییچ سرور، پشتیبانی یوتیوب (HLS)،
+ * کش درون‌حافظه‌ای و — جدید در نسخه ۳ — **تغییر IP خروجی**.
  *
  * ویژگی‌ها:
  *   - رابط «مرورگر» کامل + بازنویسی لینک‌ها/تصاویر/فرم‌ها
  *   - پچ سمت کلاینت: fetch/XHR/لینک‌های داینامیک هم از پروکسی رد می‌شوند
  *   - نگه‌داشتن کوکی‌های سایت مقصد در حافظه (ورود به سایت‌ها)
- *   - کش درون‌حافظه‌ای فایل‌های ایستا
- *   - بدون هیچ وابستگی خارجی — فقط Node.js نسخه ۱۸ به بالا
+ *   - موتور سرعت undici: اتصال‌های زنده، استریم فوری + کش موازی
+ *   - تغییر IP خروجی: استخر پروکسی رایگان، چرخش خودکار/دستی، پروکسی شخصی
  *
  * اجرا:  node server.js
  */
@@ -66,6 +66,52 @@ const HLS_JS = (() => {
   try { return fs.readFileSync(path.join(__dirname, 'hls.min.js'), 'utf8'); }
   catch (_) { return '/* hls.min.js not found */'; }
 })();
+
+/* ---------------------- موتور سرعت (undici) ---------------------- */
+
+// undici همان HTTP-کلاینتی است که داخل خود Node هم هست؛ اینجا جداگانه نصب
+// می‌شود تا بتوانیم Agent با اتصال‌های زنده‌ی طولانی و پروکسی خروجی بسازیم.
+// اگر نصب نبود، سرور با fetch پیش‌فرض هم کار می‌کند (فقط بدون تغییر IP).
+let UNDICI = null;
+try { UNDICI = await import('undici'); } catch (_) { UNDICI = null; }
+
+const FAST_AGENT = UNDICI ? new UNDICI.Agent({
+  connections: 128,            // اتصال همزمان به هر مبدأ
+  pipelining: 1,
+  keepAliveTimeout: 60_000,    // اتصال ۶۰ ثانیه زنده می‌ماند → درخواست‌های بعدی بدون TCP/TLS جدید
+  keepAliveMaxTimeout: 600_000,
+  headersTimeout: Math.max(TIMEOUT_MS, 20_000),
+  bodyTimeout: 0,              // جریان بدنه (ویدیو) بدون مهلت — فقط سرآیند مهلت دارد
+  connect: { timeout: 12_000 },
+}) : null;
+
+function doFetch(url, opts) {
+  opts = opts || {};
+  if (UNDICI) return UNDICI.fetch(url, { ...opts, dispatcher: opts.dispatcher || FAST_AGENT });
+  return fetch(url, opts);
+}
+
+/**
+ * واکشی با مهلت «فقط تا رسیدن سرآیند پاسخ».
+ * نسخه‌های قبلی کل جریان را بعد از ۳۰ ثانیه قطع می‌کردند که پخش ویدیوهای
+ * طولانی را می‌شکست؛ اینجا تایمر بعد از رسیدن پاسخ خاموش می‌شود و بدنه
+ * تا هرجا که لازم باشد جریان می‌یابد.
+ */
+async function doFetchStream(url, opts, ms) {
+  opts = opts || {};
+  const limit = ms || TIMEOUT_MS;
+  if (!UNDICI) return fetch(url, { ...opts, signal: AbortSignal.timeout(limit) });
+  const ac = new AbortController();
+  const timer = setTimeout(() => ac.abort(), limit);
+  try {
+    const r = await UNDICI.fetch(url, { ...opts, signal: ac.signal });
+    clearTimeout(timer);
+    return r;
+  } catch (e) {
+    clearTimeout(timer);
+    throw e;
+  }
+}
 
 /* --------------------------- کش درون‌حافظه‌ای --------------------------- */
 
@@ -154,6 +200,213 @@ function jarCookie(origin) {
   return [...bucket].map(([k, v]) => k + '=' + v).join('; ');
 }
 
+/* ------------------- موتور تغییر IP خروجی ------------------- */
+
+// حالت‌ها:
+//   direct → IP خودِ سرور (سریع‌ترین)
+//   pool   → چرخش بین پروکسی‌های رایگان سالم (برای دور زدن بلاک IP)
+//   manual → پروکسی شخصی که خودت می‌دهی (مثلاً پروکسی چرخشی خریداری‌شده)
+
+const PROXY_LIST_URL = String(process.env.PROXY_LIST_URL ||
+  'https://raw.githubusercontent.com/monosans/proxy-list/main/proxies/http.txt').trim();
+const POOL_SIZE = Math.min(Math.max(Number(process.env.POOL_SIZE || 20) || 20, 4), 60);
+const IP_CHECK_EVERY = 10 * 60 * 1000; // نوسازی استخر هر ۱۰ دقیقه
+
+const ipState = {
+  mode: 'direct',
+  manualUrl: '',
+  active: null,        // پروکسی فعال: {url, ip, country, cc, latency, checkedAt}
+  pool: [],            // پروکسی‌های سالم (مرتب بر اساس سرعت)
+  candidates: [],
+  lastListAt: 0,
+  checking: false,
+  directInfo: null,    // IP مستقیم خود سرور
+  lastAutoRotate: 0,
+};
+
+const proxyAgents = new Map(); // آدرس پروکسی → ProxyAgent (اتصال زنده)
+function proxyDispatcher(u) {
+  let a = proxyAgents.get(u);
+  if (!a) {
+    a = new UNDICI.ProxyAgent({
+      uri: u,
+      connections: 16,
+      keepAliveTimeout: 30_000,
+      headersTimeout: 15_000,
+      bodyTimeout: 0,
+      connect: { timeout: 10_000 },
+    });
+    if (proxyAgents.size > 48) {
+      const first = proxyAgents.keys().next().value;
+      try { proxyAgents.get(first).close(); } catch (_) { /* بسته شد */ }
+      proxyAgents.delete(first);
+    }
+    proxyAgents.set(u, a);
+  }
+  return a;
+}
+
+function activeDispatcher() {
+  if (UNDICI) {
+    if (ipState.mode === 'manual' && ipState.manualUrl) {
+      try { return proxyDispatcher(ipState.manualUrl); } catch (_) { /* پایین می‌افتد */ }
+    }
+    if (ipState.mode === 'pool' && ipState.active && ipState.active.url) {
+      try { return proxyDispatcher(ipState.active.url); } catch (_) { /* پایین می‌افتد */ }
+    }
+  }
+  return FAST_AGENT;
+}
+
+// «آینه IP» — از مسیر داده‌شده می‌پرسد IP و کشور ما چیست
+async function ipEcho(dispatcher, timeoutMs) {
+  const t0 = Date.now();
+  let j = null;
+  try {
+    const r = await UNDICI.fetch('https://ipwho.is/', {
+      dispatcher,
+      headers: { 'user-agent': UA, 'accept': 'application/json' },
+      signal: AbortSignal.timeout(timeoutMs || 9000),
+    });
+    if (r.ok) j = await r.json().catch(() => null);
+  } catch (_) { /* سرویس اول در دسترس نبود */ }
+  if (j && j.ip) {
+    return { ip: String(j.ip), country: String(j.country || ''), cc: String(j.country_code || ''), latency: Date.now() - t0 };
+  }
+  // جایگزین: ipify (بدون کشور)
+  const r2 = await UNDICI.fetch('https://api.ipify.org/?format=json', {
+    dispatcher,
+    headers: { 'user-agent': UA },
+    signal: AbortSignal.timeout(timeoutMs || 9000),
+  });
+  if (!r2.ok) throw new Error('echo ' + r2.status);
+  const j2 = await r2.json();
+  return { ip: String(j2.ip || ''), country: '', cc: '', latency: Date.now() - t0 };
+}
+
+async function testProxy(u, timeoutMs) {
+  const echo = await ipEcho(proxyDispatcher(u), timeoutMs || 9000);
+  return { url: u, ...echo, checkedAt: Date.now() };
+}
+
+async function refreshCandidateList(force) {
+  const now = Date.now();
+  if (!force && ipState.candidates.length && now - ipState.lastListAt < IP_CHECK_EVERY) return;
+  try {
+    const r = await doFetch(PROXY_LIST_URL, {
+      headers: { 'user-agent': UA },
+      signal: AbortSignal.timeout(20000),
+    });
+    const text = await r.text();
+    const seen = new Set();
+    const list = [];
+    for (let line of text.split(/\r?\n/)) {
+      line = line.trim();
+      if (/^[\w.-]+:\d+$/.test(line) && !seen.has(line)) {
+        seen.add(line);
+        list.push('http://' + line);
+      }
+      if (list.length >= 160) break;
+    }
+    for (let i = list.length - 1; i > 0; i--) {
+      const j = Math.floor(Math.random() * (i + 1));
+      [list[i], list[j]] = [list[j], list[i]];
+    }
+    ipState.candidates = list;
+    ipState.lastListAt = now;
+  } catch (_) { /* فهرست قبلی می‌ماند */ }
+}
+
+async function healthCheckPool() {
+  if (!UNDICI || ipState.checking) return;
+  ipState.checking = true;
+  try {
+    await refreshCandidateList(false);
+    const need = POOL_SIZE + 6 - ipState.pool.length;
+    if (need <= 0) return;
+    const known = new Set(ipState.pool.map((p) => p.url));
+    const fresh = ipState.candidates.filter((u) => !known.has(u));
+    const batch = fresh.slice(0, 90);
+    const ok = [];
+    let idx = 0;
+    const worker = async () => {
+      while (idx < batch.length && ok.length < POOL_SIZE + 4) {
+        const u = batch[idx++];
+        try { ok.push(await testProxy(u, 8000)); } catch (_) { /* پروکسی مرده */ }
+      }
+    };
+    await Promise.all(Array.from({ length: 10 }, worker));
+    const byUrl = new Map(ipState.pool.map((p) => [p.url, p]));
+    for (const p of ok) byUrl.set(p.url, p);
+    ipState.pool = [...byUrl.values()].sort((a, b) => a.latency - b.latency).slice(0, POOL_SIZE);
+  } finally {
+    ipState.checking = false;
+  }
+}
+
+// چرخش به یک پروکسی سالمِ دیگر (تست تازه قبل از فعال‌سازی)
+async function rotateIp() {
+  if (!UNDICI) throw new Error('ماژول undici در دسترس نیست؛ npm install را اجرا کن.');
+  ipState.mode = 'pool';
+  if (!ipState.pool.length) {
+    await healthCheckPool();
+    if (!ipState.pool.length) throw new Error('فعلاً هیچ پروکسی سالمی در استخر نیست؛ کمی بعد دوباره امتحان کن.');
+  }
+  const cur = ipState.active && ipState.active.url;
+  const order = ipState.pool.filter((p) => p.url !== cur);
+  for (let i = 0; i < Math.min(order.length, 6); i++) {
+    try {
+      ipState.active = await testProxy(order[i].url, 9000);
+      return ipState.active;
+    } catch (_) {
+      ipState.pool = ipState.pool.filter((p) => p.url !== order[i].url);
+    }
+  }
+  throw new Error('هیچ پروکسی سالمی پیدا نشد؛ کمی بعد دوباره امتحان کن.');
+}
+
+// بعد از دو خطای پیاپی، در پس‌زمینه به پروکسی بعدی برو
+function noteRouteFailure() {
+  if (ipState.mode === 'pool' && ipState.active) {
+    ipState.active.fails = (ipState.active.fails || 0) + 1;
+    if (ipState.active.fails >= 2 && Date.now() - ipState.lastAutoRotate > 15000) {
+      ipState.lastAutoRotate = Date.now();
+      rotateIp().catch(() => { /* بعداً دوباره */ });
+    }
+  }
+}
+
+function ipStatusJson() {
+  return {
+    supported: !!UNDICI,
+    mode: ipState.mode,
+    manualUrl: ipState.manualUrl,
+    direct: ipState.directInfo,
+    active: ipState.active ? {
+      url: ipState.active.url, ip: ipState.active.ip,
+      country: ipState.active.country, cc: ipState.active.cc,
+      latency: ipState.active.latency,
+    } : null,
+    pool: { size: ipState.pool.length, checking: ipState.checking },
+  };
+}
+
+// بعد از بالا آمدن سرور: IP مستقیم + پیش‌گرم استخر
+setTimeout(async () => {
+  if (!UNDICI) return;
+  try {
+    const echo = await ipEcho(FAST_AGENT, 10000);
+    ipState.directInfo = echo;
+    console.log('  IP مستقیم سرور: ' + echo.ip + (echo.country ? ' (' + echo.country + ')' : ''));
+  } catch (_) { /* بعداً */ }
+  try { await healthCheckPool(); } catch (_) { /* بعداً */ }
+  if (ipState.pool.length) console.log('  استخر پروکسی: ' + ipState.pool.length + ' پروکسی سالم آماده چرخش IP');
+}, 3000);
+
+setInterval(() => {
+  if (ipState.mode === 'pool') healthCheckPool().catch(() => { /* بعداً */ });
+}, IP_CHECK_EVERY);
+
 /* ------------------------- واکشی از مقصد ------------------------- */
 
 const FWD_HEADERS = ['sec-ch-ua', 'sec-ch-ua-mobile', 'sec-ch-ua-platform',
@@ -187,13 +440,13 @@ async function fetchTarget(targetUrl, method, reqHeaders, bodyBuf) {
       headers['content-type'] = reqHeaders['content-type'] || 'application/octet-stream';
     }
 
-    resp = await fetch(url, {
+    resp = await doFetchStream(url, {
       method: m,
       headers,
       body: (m === 'GET' || m === 'HEAD') ? undefined : buf,
       redirect: 'manual',
-      signal: AbortSignal.timeout(TIMEOUT_MS),
-    });
+      dispatcher: activeDispatcher(),
+    }, TIMEOUT_MS);
 
     jarAdd(uu.origin, resp.headers.getSetCookie ? resp.headers.getSetCookie() : (resp.headers.get('set-cookie') ? [resp.headers.get('set-cookie')] : []));
 
@@ -229,8 +482,9 @@ async function hlsRequest(req, res, u) {
 
   let resp;
   try {
-    resp = await fetch(u, { headers, redirect: 'follow', signal: AbortSignal.timeout(TIMEOUT_MS) });
+    resp = await doFetchStream(u, { headers, redirect: 'follow', dispatcher: activeDispatcher() }, TIMEOUT_MS);
   } catch (e) {
+    noteRouteFailure();
     res.writeHead(502, { 'content-type': 'text/plain' });
     return res.end('upstream error');
   }
@@ -248,22 +502,11 @@ async function hlsRequest(req, res, u) {
     return res.end(out);
   }
 
-  // سگمنت: بافر + کش + ارسال
-  const chunks = [];
-  let size = 0;
-  let tooBig = false;
-  for await (const c of resp.body) {
-    size += c.length;
-    if (size > CACHE_ITEM_MAX) { tooBig = true; break; }
-    chunks.push(Buffer.isBuffer(c) ? c : Buffer.from(c));
-  }
-  const buf = Buffer.concat(chunks);
-  const ttl = cacheTtlOf({});
-  if (!tooBig) cachePut(key, buf, ctype, 21600);
-
+  // سگمنت ویدیو: پاسخ فوری به پخش‌کننده + ذخیره در کش به‌صورت موازی
+  const noCache = req.method !== 'GET' || !!req.headers.range;
   const h = {
     'content-type': ctype || 'application/octet-stream',
-    'cache-control': 'public, max-age=' + (tooBig ? 1800 : 21600),
+    'cache-control': 'public, max-age=' + (noCache ? 1800 : 21600),
     'x-px-cache': 'MISS',
     'x-robots-tag': 'noindex',
     'accept-ranges': 'bytes',
@@ -271,10 +514,25 @@ async function hlsRequest(req, res, u) {
   const cr = resp.headers.get('content-range');
   if (cr) h['content-range'] = cr;
   res.writeHead(resp.status, h);
-  res.end(buf);
-  if (tooBig) {
-    try { Readable.fromWeb(resp.body).pipe(res); } catch (_) { /* بسته شد */ }
-  }
+  if (!resp.body) return res.end();
+  const src = Readable.fromWeb(resp.body);
+  if (noCache) return src.pipe(res);
+
+  const chunks = [];
+  let cachedBytes = 0;
+  let overflow = false;
+  src.on('data', (c) => {
+    if (!overflow) {
+      cachedBytes += c.length;
+      if (cachedBytes > CACHE_ITEM_MAX) overflow = true;
+      else chunks.push(c);
+    }
+  });
+  src.on('end', () => {
+    if (!overflow && chunks.length) cachePut(key, Buffer.concat(chunks), ctype, 21600);
+  });
+  src.on('error', () => { /* کش نمی‌شود */ });
+  src.pipe(res);
 }
 
 /* --------------------------- پروکسی اصلی --------------------------- */
@@ -296,10 +554,15 @@ async function proxyRequest(targetUrl, req, res, bodyBuf) {
   try {
     out = await fetchTarget(targetUrl, method, req.headers, bodyBuf);
   } catch (e) {
+    noteRouteFailure();
     const timedOut = e && (e.name === 'TimeoutError' || e.name === 'AbortError');
+    const viaProxy = ipState.mode !== 'direct';
     return sendHtml(res, 502, errorPage(502,
       timedOut ? 'مهلت اتصال به سایت مقصد تمام شد.' : 'اتصال به سایت مقصد برقرار نشد.',
-      targetUrl, e && e.message));
+      targetUrl,
+      viaProxy
+        ? 'مسیر فعلی از پروکسی خروجی می‌گذرد؛ اگر خطا تکرار شد از منوی «تغییر IP» یک IP جدید انتخاب کن.'
+        : (e && e.message)));
   }
 
   const { resp, url: finalUrl } = out;
@@ -355,39 +618,33 @@ async function proxyRequest(targetUrl, req, res, bodyBuf) {
     return;
   }
 
-  // ایستا (عکس/فونت/اسکریپت/ویدیو): بافر + کش
-  if (cacheable && resp.status === 200 && CACHE_TYPES.test(ctype) && !resp.headers.get('set-cookie')) {
-    const chunks = [];
-    let size = 0;
-    let tooBig = false;
-    for await (const c of resp.body) {
-      size += c.length;
-      if (size > CACHE_ITEM_MAX) { tooBig = true; break; }
-      chunks.push(Buffer.isBuffer(c) ? c : Buffer.from(c));
-    }
-    if (!tooBig) {
-      const buf = Buffer.concat(chunks);
-      const ttl = cacheTtlOf(resp.headers);
-      cachePut('static:' + targetUrl, buf, ctype, ttl);
-      res.writeHead(200, {
-        'content-type': ctype,
-        'cache-control': 'public, max-age=' + ttl,
-        'x-px-cache': 'MISS',
-        'x-robots-tag': 'noindex',
-        'accept-ranges': 'bytes',
-      });
-      return res.end(buf);
-    }
-    res.writeHead(resp.status, headers);
-    for (const c of chunks) res.write(c);
-    Readable.fromWeb(resp.body).pipe(res);
-    return;
-  }
-
-  // محتوای باینری: مستقیم جریانی
+  // ایستا (عکس/فونت/اسکریپت/ویدیو): پاسخ فوری + کش موازی
+  // (نسخه‌های قبلی کل فایل را بافر می‌کردند و بعد می‌فرستادند؛ الان بایت
+  // اول همان لحظه به سمت مرورگر می‌رود و کش هم در پس‌زمینه پر می‌شود)
+  const wantCache = cacheable && resp.status === 200 && CACHE_TYPES.test(ctype) && !resp.headers.get('set-cookie');
+  if (wantCache) headers['x-px-cache'] = 'MISS';
   res.writeHead(resp.status, headers);
   if (!resp.body) return res.end();
-  Readable.fromWeb(resp.body).pipe(res);
+  const src = Readable.fromWeb(resp.body);
+  if (!wantCache) return src.pipe(res);
+
+  const cChunks = [];
+  let cSize = 0;
+  let cOver = false;
+  src.on('data', (c) => {
+    if (!cOver) {
+      cSize += c.length;
+      if (cSize > CACHE_ITEM_MAX) cOver = true;
+      else cChunks.push(c);
+    }
+  });
+  src.on('end', () => {
+    if (!cOver && cChunks.length) {
+      cachePut('static:' + targetUrl, Buffer.concat(cChunks), ctype, cacheTtlOf(resp.headers));
+    }
+  });
+  src.on('error', () => { /* کش نمی‌شود */ });
+  src.pipe(res);
 }
 
 /* --------------------------- احراز هویت --------------------------- */
@@ -463,6 +720,62 @@ async function handle(req, res) {
       'cache-control': 'public, max-age=31536000, immutable',
     });
     return res.end(HLS_JS);
+  }
+
+  /* ---------- تغییر IP خروجی ---------- */
+  if (p === '/_ip') {
+    res.writeHead(200, {
+      'content-type': 'application/json; charset=utf-8',
+      'cache-control': 'no-store',
+      'access-control-allow-origin': '*',
+    });
+    return res.end(JSON.stringify(ipStatusJson()));
+  }
+  if (p === '/_ip/rotate' && req.method === 'POST') {
+    try {
+      await rotateIp();
+      res.writeHead(200, { 'content-type': 'application/json; charset=utf-8', 'access-control-allow-origin': '*' });
+      return res.end(JSON.stringify({ ok: true, ...ipStatusJson() }));
+    } catch (e) {
+      res.writeHead(503, { 'content-type': 'application/json; charset=utf-8', 'access-control-allow-origin': '*' });
+      return res.end(JSON.stringify({ ok: false, error: String(e && e.message || e), ...ipStatusJson() }));
+    }
+  }
+  if (p === '/_ip/mode' && req.method === 'POST') {
+    const body = await readBody(req, 64 * 1024).catch(() => Buffer.alloc(0));
+    let mode = '';
+    let proxyUrl = '';
+    const raw = body.toString('utf8').trim();
+    try {
+      const j = JSON.parse(raw);
+      mode = String(j.mode || '');
+      proxyUrl = String(j.proxyUrl || '').trim();
+    } catch (_) {
+      mode = String(new URLSearchParams(raw).get('mode') || '');
+      proxyUrl = String(new URLSearchParams(raw).get('proxyUrl') || '').trim();
+    }
+    if (!['direct', 'pool', 'manual'].includes(mode)) {
+      res.writeHead(400, { 'content-type': 'application/json; charset=utf-8', 'access-control-allow-origin': '*' });
+      return res.end(JSON.stringify({ ok: false, error: 'mode باید direct یا pool یا manual باشد.' }));
+    }
+    if (mode === 'manual') {
+      if (!/^https?:\/\/[\w.-]+:\d+$/.test(proxyUrl)) {
+        res.writeHead(400, { 'content-type': 'application/json; charset=utf-8', 'access-control-allow-origin': '*' });
+        return res.end(JSON.stringify({ ok: false, error: 'آدرس پروکسی باید به شکل http://host:port باشد.' }));
+      }
+      ipState.manualUrl = proxyUrl;
+      ipState.active = null;
+    } else if (mode === 'pool') {
+      ipState.manualUrl = '';
+      if (!ipState.active) {
+        try { await rotateIp(); } catch (_) { /* استخر خالی؛ بعداً دوباره */ }
+      }
+    } else {
+      ipState.manualUrl = '';
+    }
+    ipState.mode = mode;
+    res.writeHead(200, { 'content-type': 'application/json; charset=utf-8', 'access-control-allow-origin': '*' });
+    return res.end(JSON.stringify({ ok: true, ...ipStatusJson() }));
   }
 
   /* ---------- مسیرهای یوتیوب ---------- */
@@ -586,6 +899,8 @@ server.on('error', (err) => {
 server.listen(PORT, () => {
   console.log('وب‌پروکسی شخصی (مرورگر پروکسی) اجرا شد.');
   console.log('  آدرس محلی: http://localhost:' + PORT);
+  console.log('  موتور سرعت: ' + (UNDICI ? 'undici (اتصال زنده ۶۰ث)' : 'fetch پیش‌فرض'));
+  console.log('  تغییر IP خروجی: ' + (UNDICI ? 'فعال — مستقیم / چرخش خودکار / پروکسی دستی' : 'غیرفعال (undici نصب نیست)'));
   if (PASSWORD) console.log('  قفل رمز: فعال');
   else console.log('  هشدار: رمزی تنظیم نشده؛ برای سرور عمومی PROXY_PASSWORD را تنظیم کنید.');
 });

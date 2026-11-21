@@ -1226,6 +1226,7 @@ function renderMenu(){
   +'<div class="mi" data-a="zreset">بازنشانی بزرگ‌نمایی<span class="sc">Ctrl 0</span></div>'
   +'<div class="msep"></div>'
   +'<div class="mi" data-a="settings">تنظیمات و سرورها</div>'
+  +'<div class="mi" data-a="ip">تغییر IP خروجی</div>'
   +'<div class="mi" data-a="about">درباره</div>';
 }
 menuEl.addEventListener('click',function(e){
@@ -1241,6 +1242,7 @@ menuEl.addEventListener('click',function(e){
   else if(a==='zout')setZoom(active?active.zoom-0.1:1);
   else if(a==='zreset')setZoom(1);
   else if(a==='settings')showSettings();
+  else if(a==='ip')showIpPanel();
   else if(a==='about')showAbout();
 });
 var overlay=el('overlay'),panelbox=el('panelbox');
@@ -1289,8 +1291,8 @@ function showBookmarks(){
 }
 function showAbout(){
   openPanel({t:'درباره',b:
-   '<p class="tiny">مرورگر پروکسی شخصی — نسخه ۲.۱</p>'
-  +'<p class="tiny">تمام صفحات از طریق سرور واسط باز می‌شوند؛ لینک‌ها، تصاویر، فرم‌ها و درخواست‌های داینامیک هم از مسیر پروکسی رد می‌شوند. پشتیبانی پخش یوتیوب با کیفیت انتخابی.</p>'
+   '<p class="tiny">مرورگر پروکسی شخصی — نسخه ۳.۰</p>'
+  +'<p class="tiny">تمام صفحات از طریق سرور واسط باز می‌شوند؛ لینک‌ها، تصاویر، فرم‌ها و درخواست‌های داینامیک هم از مسیر پروکسی رد می‌شوند. پشتیبانی پخش یوتیوب با کیفیت انتخابی، موتور سرعت با اتصال‌های زنده و — روی لایه‌های Node — تغییر IP خروجی.</p>'
   +'<p class="tiny">میان‌برها: <b>Ctrl+T</b> تب جدید · <b>Ctrl+W</b> بستن تب · <b>Ctrl+L</b> نوار آدرس · <b>Ctrl+D</b> نشانک · <b>Ctrl+F</b> جستجو در صفحه · <b>Alt+→/←</b> عقب/جلو · <b>Ctrl +/-/0</b> بزرگ‌نمایی</p>'});
 }
 /* ---------- تنظیمات و سوییچ سرور ---------- */
@@ -1377,6 +1379,98 @@ function showSettings(){
       renderBm();alert('داده‌ها بازیابی شد.');
     }catch(e){alert('متن داده معتبر نیست.');}
   };
+}
+/* ---------- تغییر IP خروجی ---------- */
+function showIpPanel(){
+  var base=backend();
+  openPanel({t:'تغییر IP خروجی',b:
+   '<p class="tiny">IP خروجی همان آی‌پی‌ای است که سایت‌های مقصد می‌بینند. روی لایه‌های Node (Railway / Render / سرور شخصی) می‌توان آن را عوض کرد؛ لایه‌ی Cloudflare این قابلیت را ندارد.</p>'
+  +'<div class="brow"><span class="bn">سرور فعال</span><span class="bu">'+esc2(base)+'</span>'
+  +'<button class="pbtn" id="ipTest">تست IP فعلی</button></div>'
+  +'<div class="brow"><span class="bn">نتیجه</span><span class="bu" id="ipLive">—</span><span class="ms" id="ipMs"></span></div>'
+  +'<div id="ipBox" style="margin-top:8px"><p class="tiny">در حال بررسی پشتیبانی سرور…</p></div>'});
+  panelbox.querySelector('#ipTest').onclick=function(){
+    var sp=panelbox.querySelector('#ipLive');
+    sp.textContent='در حال تست…';
+    panelbox.querySelector('#ipMs').textContent='';
+    var t0=Date.now();
+    fetch(base+'/proxy?url='+encodeURIComponent('https://api.ipify.org/?format=json'),{cache:'no-store'})
+      .then(function(r){return r.text();})
+      .then(function(tx){
+        var ip='';
+        try{ip=(JSON.parse(tx).ip)||tx.slice(0,48);}catch(e){ip=tx.slice(0,48);}
+        sp.textContent=ip;
+        panelbox.querySelector('#ipMs').textContent=(Date.now()-t0)+' ms';
+      })
+      .catch(function(){sp.textContent='خطا در تست';});
+  };
+  fetch(base+'/_ip',{cache:'no-store'}).then(function(r){return r.ok?r.json():null;}).then(function(st){
+    if(!st||!st.supported){
+      panelbox.querySelector('#ipBox').innerHTML=
+        '<p class="tiny" style="color:#fbbf24">⚠ این سرور از تغییر IP پشتیبانی نمی‌کند (لایه‌ی Cloudflare).</p>'
+       +'<p class="tiny">از منوی ⋮ ← «تنظیمات و سرورها» یک سرور Railway یا Render را فعال کن و دوباره این پنل را باز کن. تست سرعت سرورها هم سریع‌ترین را پیدا می‌کند.</p>';
+      return;
+    }
+    renderIpCtl(st);
+  }).catch(function(){
+    panelbox.querySelector('#ipBox').innerHTML='<p class="tiny">سرور پاسخ نداد؛ دوباره امتحان کن.</p>';
+  });
+  function renderIpCtl(st){
+    var mode=st.mode||'direct';
+    var h='<p class="tiny" style="margin-top:6px">حالت مسیر خروجی:</p>'
+    +'<div class="brow"><input type="radio" name="ipm" value="direct"'+(mode==='direct'?' checked':'')+'><span class="bn">مستقیم (سریع‌ترین)</span><span class="bu">'
+      +(st.direct&&st.direct.ip?('IP سرور: '+esc2(st.direct.ip)+(st.direct.country?(' — '+esc2(st.direct.country)):'')):'IP خودِ سرور')+'</span></div>'
+    +'<div class="brow"><input type="radio" name="ipm" value="pool"'+(mode==='pool'?' checked':'')+'><span class="bn">چرخش پروکسی رایگان</span><span class="bu">'
+      +(st.pool&&st.pool.size?('استخر: '+st.pool.size+' پروکسی سالم'):'در حال آماده‌سازی استخر…')+'</span></div>'
+    +'<div class="brow"><input type="radio" name="ipm" value="manual"'+(mode==='manual'?' checked':'')+'><span class="bn">پروکسی شخصی</span><span class="bu">http://host:port</span></div>'
+    +'<div id="ipExtra" style="margin-top:8px"></div>';
+    panelbox.querySelector('#ipBox').innerHTML=h;
+    function extra(){
+      var m=panelbox.querySelector('input[name=ipm]:checked').value;
+      var ex=panelbox.querySelector('#ipExtra');
+      if(m==='direct'){
+        ex.innerHTML='<p class="tiny">همه‌ی درخواست‌ها با IP خودِ سرور می‌روند — سریع‌ترین حالت. اگر سایتی این IP را بسته، یکی از دو حالت دیگر را انتخاب کن.</p>';
+      } else if(m==='pool'){
+        ex.innerHTML='<div class="frow"><button class="pbtn pri" id="ipRot">🔄 گرفتن IP جدید</button></div>'
+        +(st.active?'<p class="tiny">پروکسی فعال: <b style="direction:ltr">'+esc2(st.active.ip)+'</b>'+(st.active.country?(' — '+esc2(st.active.country)):'')+' · '+st.active.latency+'ms</p>':'')
+        +'<p class="tiny">هر بار «گرفتن IP جدید» یک پروکسی سالمِ دیگر فعال می‌شود. پروکسی‌های رایگان کندتر از مسیر مستقیم‌اند؛ بعد از تمام شدن کار برگرد به حالت مستقیم.</p>';
+        panelbox.querySelector('#ipRot').onclick=function(){
+          var b=this;b.disabled=true;b.textContent='در حال جستجوی پروکسی سالم… (تا ۱ دقیقه)';
+          fetch(base+'/_ip/rotate',{method:'POST'}).then(function(r){return r.json();}).then(function(j){
+            if(j.ok&&j.active){
+              renderIpCtl(j);
+              var live=panelbox.querySelector('#ipLive');if(live)live.textContent=j.active.ip;
+              panelbox.querySelector('#ipTest').click();
+            } else {
+              b.disabled=false;b.textContent='🔄 گرفتن IP جدید';
+              alert(j.error||'پروکسی سالمی پیدا نشد؛ کمی بعد دوباره امتحان کن.');
+            }
+          }).catch(function(){b.disabled=false;b.textContent='🔄 گرفتن IP جدید';alert('ارتباط با سرور برقرار نشد.');});
+        };
+      } else {
+        ex.innerHTML='<div class="frow"><input id="ipUrl" placeholder="http://host:port" direction="ltr" value="'+esc2(st.manualUrl||'')+'"><button class="pbtn pri" id="ipSetM">فعال‌سازی</button></div>'
+        +'<p class="tiny">آدرس پروکسی شخصی‌ات را بده (مثلاً پروکسی چرخشی خریداری‌شده). همه‌ی ترافیک از آن می‌گذرد.</p>';
+        panelbox.querySelector('#ipSetM').onclick=function(){
+          var u=panelbox.querySelector('#ipUrl').value.trim();
+          fetch(base+'/_ip/mode',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({mode:'manual',proxyUrl:u})})
+            .then(function(r){return r.json();}).then(function(j){
+              if(j.ok){renderIpCtl(j);alert('پروکسی شخصی فعال شد.');}
+              else{alert(j.error||'پروکسی فعال نشد.');}
+            }).catch(function(){alert('ارتباط با سرور برقرار نشد.');});
+        };
+      }
+    }
+    panelbox.querySelectorAll('input[name=ipm]').forEach(function(r){
+      r.addEventListener('change',function(){
+        var m=this.value;
+        fetch(base+'/_ip/mode',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({mode:m})})
+          .then(function(r2){return r2.json();}).then(function(j){if(j.ok)renderIpCtl(j);})
+          .catch(function(){alert('تغییر حالت ممکن نشد.');});
+      });
+      r.addEventListener('change',extra);
+    });
+    extra();
+  }
 }
 /* ---------- جستجو در صفحه ---------- */
 var findbar=el('findbar'),fq=el('fq'),marks=[];

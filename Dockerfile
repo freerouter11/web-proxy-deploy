@@ -6,8 +6,11 @@ FROM node:20-alpine
 RUN mkdir -p /app && chown -R node:node /app
 WORKDIR /app
 
-# فقط فایل‌های لازم (کد سبک و بدون وابستگی npm)
-COPY --chown=node:node package.json railway.json ./
+# وابستگی (فقط undici — موتور سرعت و تغییر IP)
+COPY --chown=node:node package.json package-lock.json railway.json ./
+RUN npm ci --omit=dev && chown -R node:node node_modules
+
+# فقط فایل‌های لازم (کد سبک)
 COPY --chown=node:node server.js lib.mjs assets.js hls.min.js ./
 
 ENV NODE_ENV=production
