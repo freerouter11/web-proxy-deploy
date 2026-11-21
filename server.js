@@ -471,7 +471,9 @@ async function handle(req, res) {
     const v = (u.searchParams.get('v') || '').trim();
     if (!/^[\w-]{6,15}$/.test(v)) return sendHtml(res, 400, errorPage(400, 'شناسه‌ی ویدیو معتبر نیست.', v));
     try {
-      const info = await ytPlayerInfo(v);
+      /* کوکی نشست یوتیوب از جار (اگر کاربر از طریق پروکسی لاگین کرده باشد) */
+      const ytCookie = jarCookie('https://www.youtube.com') || '';
+      const info = await ytPlayerInfo(v, { cookie: ytCookie, ua: req.headers['user-agent'] });
       return sendHtml(res, 200, ytPlayerPage(info));
     } catch (e) {
       return sendHtml(res, 502, errorPage(502, 'دریافت اطلاعات ویدیو از یوتیوب ممکن نشد.', 'https://www.youtube.com/watch?v=' + v, e && e.message));

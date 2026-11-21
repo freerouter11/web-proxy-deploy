@@ -395,15 +395,16 @@ function memSet(k, v) {
   ytMem.set(k, { at: Date.now(), val: v });
 }
 
-async function innertube(endpoint, body, key, ua) {
+async function innertube(endpoint, body, key, ua, extra) {
+  const headers = {
+    'content-type': 'application/json',
+    'user-agent': (extra && extra.ua) || ua,
+    'cookie': (extra && extra.cookie) || 'SOCS=CAI',
+    'origin': 'https://www.youtube.com',
+  };
   const r = await fetch('https://www.youtube.com/youtubei/v1/' + endpoint + '?key=' + key + '&prettyPrint=false', {
     method: 'POST',
-    headers: {
-      'content-type': 'application/json',
-      'user-agent': ua,
-      'cookie': 'SOCS=CAI',
-      'origin': 'https://www.youtube.com',
-    },
+    headers,
     body: JSON.stringify(body),
   });
   if (!r.ok) throw new Error('innertube ' + endpoint + ': ' + r.status);
@@ -473,19 +474,56 @@ function collectVideos(data) {
   return out;
 }
 
-async function ytPlayerInfo(videoId) {
-  const ck = 'player:' + videoId;
+async function ytPlayerInfo(videoId, opts) {
+  opts = opts || {};
+  const ck = 'player:' + (opts.cookie ? 'auth:' : 'anon:') + videoId;
   const cached = memGet(ck, 10 * 60 * 1000);
   if (cached) return cached;
-  const d = await innertube('player', {
-    context: { client: YT_IOS_CLIENT },
-    videoId, contentCheckOk: true, racyCheckOk: true,
-  }, YT_IOS_KEY, YT_IOS_UA);
-  const status = ((d.playabilityStatus || {}).status) || '';
+  let d = null;
+  /* مسیر لاگین‌دار: کوکی نشست کاربر (از جار سرور) → رد شدن از چالش ربات */
+  if (opts.cookie) {
+    try {
+      d = await innertube('player', {
+        context: { client: YT_IOS_CLIENT },
+        videoId, contentCheckOk: true, racyCheckOk: true,
+      }, YT_IOS_KEY, YT_IOS_UA, { cookie: opts.cookie });
+    } catch (_) { d = null; }
+  }
+  if (!d) {
+    d = await innertube('player', {
+      context: { client: YT_IOS_CLIENT },
+      videoId, contentCheckOk: true, racyCheckOk: true,
+    }, YT_IOS_KEY, YT_IOS_UA);
+  }
+  let status = ((d.playabilityStatus || {}).status) || '';
+  let sd = d.streamingData || {};
+  /* اگر نشست لاگین‌دار با کلاینت IOS باز نشد، کلاینت WEB با همان کوکی */
+  if (status !== 'OK' && opts.cookie) {
+    try {
+      const d2 = await innertube('player', {
+        context: { client: YT_WEB_CLIENT },
+        videoId, contentCheckOk: true, racyCheckOk: true,
+      }, YT_WEB_KEY, opts.ua || UA, { cookie: opts.cookie });
+      const st2 = ((d2.playabilityStatus || {}).status) || '';
+      const sd2 = (d2.streamingData || {});
+      const hasUrl = ((sd2.formats || []).some((f) => f.url)) || sd2.hlsManifestUrl;
+      if (st2 === 'OK' && hasUrl) { d = d2; status = st2; sd = sd2; }
+    } catch (_) { /* همان نتیجه‌ی قبلی می‌ماند */ }
+  }
   const vd = d.videoDetails || {};
-  const sd = d.streamingData || {};
+  const hls = sd.hlsManifestUrl || '';
+  /* فرمت‌های progressive با لینک مستقیم (مسیر WEB لاگین‌دار) */
+  const formats = [];
+  for (const f of (sd.formats || [])) {
+    if (!f.url || !/^video\/(mp4|webm)/i.test(f.mimeType || '')) continue;
+    formats.push({
+      url: f.url,
+      label: f.qualityLabel || (f.height ? f.height + 'p' : ''),
+    });
+  }
+  formats.sort((a, b) => (parseInt(b.label, 10) || 0) - (parseInt(a.label, 10) || 0));
   const info = {
-    ok: status === 'OK' && !!sd.hlsManifestUrl,
+    ok: status === 'OK' && !!(hls || formats.length),
     status,
     videoId,
     title: vd.title || '(بی‌نام)',
@@ -494,7 +532,8 @@ async function ytPlayerInfo(videoId) {
     viewCount: vd.viewCount || '0',
     description: (vd.shortDescription || '').slice(0, 4000),
     thumb: bestThumb((vd.thumbnail || {}).thumbnails),
-    hls: sd.hlsManifestUrl || '',
+    hls,
+    formats,
     reason: ((d.playabilityStatus || {}).reason) || '',
   };
   if (info.ok) memSet(ck, info);
@@ -693,14 +732,16 @@ function ytPlayerPage(info) {
   const target = 'https://www.youtube.com/watch?v=' + encodeURIComponent(info.videoId);
   if (!info.ok) {
     const reason = info.reason || 'پخش این ویدیو در دسترس نیست.';
-    const gated = /sign in|bot|confirm/i.test(reason) || info.status === 'LOGIN_REQUIRED';
+    const gated = /sign in|bot|confirm|ربات|ورود/i.test(reason) || info.status === 'LOGIN_REQUIRED';
     return ytDoc('خطای پخش — یوتیوب', `
 <div class="perr">
-<b>پخش این ویدیو ممکن نشد.</b><br>
+<b>پخش مستقیم این ویدیو ممکن نشد.</b><br>
 ${esc(reason)}
-${gated ? '<br><span style="font-size:12.5px;opacity:.85">یوتیوب موقتاً برای این ویدیو درخواست تأیید کرده — معمولاً بعد از چند دقیقه تا چند ساعت درست می‌شود. ویدیوهای دیگری را هم امتحان کن.</span>' : ''}
-<br>
-<a href="/yt/watch?v=${esc(info.videoId)}" style="display:inline-block;margin-top:12px;padding:12px 26px;border-radius:12px;background:linear-gradient(135deg,#f43f5e,#fb7185);color:#fff;font-weight:700;text-decoration:none">تلاش مجدد</a> &nbsp;&nbsp;
+${gated ? '<div style="font-size:13px;opacity:.9;text-align:right;margin-top:10px;line-height:2">گوگل درخواست‌های سرورهای ابری را به‌عنوان ربات تشخیص می‌دهد (سیاست جدید یوتیوب). دو راه داری:<br>۱) <b>پخش‌کننده‌ی جایگزین</b> زیر را امتحان کن — برای بسیاری از ویدیوها کار می‌کند.<br>۲) در آدرس‌بار پروکسی <b>youtube.com</b> را باز کن و <b>وارد اکانت گوگل</b> شو؛ نشست لاگین سمت سرور نگه داشته می‌شود و بعد از آن پخش مستقیم معمولاً آزاد می‌شود.</div>' : ''}
+</div>
+${gated ? `<div class="pwrap" style="margin-top:14px"><div class="player"><iframe src="/yt/embed?v=${esc(info.videoId)}" style="width:100%;height:100%;border:0" allowfullscreen loading="lazy"></iframe></div><p class="hintp" style="margin-top:8px">پخش‌کننده‌ی جایگزین (embed)</p></div>` : ''}
+<div style="margin-top:16px">
+<a href="/yt/watch?v=${esc(info.videoId)}" style="display:inline-block;padding:12px 26px;border-radius:12px;background:linear-gradient(135deg,#f43f5e,#fb7185);color:#fff;font-weight:700;text-decoration:none">تلاش مجدد</a> &nbsp;&nbsp;
 <a href="/yt/" style="color:#7dd3fc">بازگشت به یوتیوب</a>
 </div>`, target);
   }
@@ -710,6 +751,11 @@ ${gated ? '<br><span style="font-size:12.5px;opacity:.85">یوتیوب موقت�
     info.lengthSeconds ? fmtDur(info.lengthSeconds) : '',
   ].filter(Boolean).map((x) => '<span>' + x + '</span>').join('');
   const poster = info.thumb ? ' poster="/proxy?url=' + encodeURIComponent(info.thumb) + '"' : '';
+  const useHls = !!info.hls;
+  const srcs = (info.formats || []).map((f) => ({
+    u: '/proxy?url=' + encodeURIComponent(f.url),
+    q: f.label || 'خودکار',
+  }));
   return ytDoc(info.title + ' — یوتیوب', `
 <div class="pwrap">
 <div class="player"><video id="v" controls playsinline preload="metadata"${poster}></video></div>
@@ -722,58 +768,83 @@ ${gated ? '<br><span style="font-size:12.5px;opacity:.85">یوتیوب موقت�
 <div class="pmeta">${meta}</div>
 <details class="desc"><summary>توضیحات</summary>${esc(info.description) || 'بدون توضیحات'}</details>
 </div>
-<script src="/assets/hls.min.js"></script>
+${useHls ? '<script src="/assets/hls.min.js"></script>' : ''}
 <script>
 (function(){
 var video=document.getElementById('v');
-var src=${JSON.stringify('/yt/api/hls?u=' + encodeURIComponent(info.hls))};
 var st=document.getElementById('st');
 var qsel=document.getElementById('qsel');
 var KEY='pxyt_${esc(info.videoId)}';
 try{var saved=parseFloat(localStorage.getItem(KEY)||'0');}catch(e){var saved=0;}
-function qs(list){
-  for(var i=0;i<list.length;i++){
-    var o=document.createElement('option');
-    o.value=String(i);
-    o.textContent=(list[i].height?list[i].height+'p':'سطح '+(i+1))+(list[i].bitrate?' · '+Math.round(list[i].bitrate/1000)+'kbps':'');
-    qsel.appendChild(o);
-  }
-}
-if(window.Hls&&Hls.isSupported()){
-  var hls=new Hls({maxBufferLength:60,backBufferLength:30,startLevel:-1});
-  hls.loadSource(src);
-  hls.attachMedia(video);
-  hls.on(Hls.Events.MANIFEST_PARSED,function(){
-    qs(hls.levels);
-    st.textContent='آماده پخش';
-  });
-  hls.on(Hls.Events.LEVEL_SWITCHED,function(e,d){
-    var lv=hls.levels[d.level];
-    if(lv&&lv.height)st.textContent='در حال پخش: '+lv.height+'p';
-  });
-  hls.on(Hls.Events.ERROR,function(e,d){
-    if(d.fatal){
-      st.textContent='خطا در بارگیری; در حال تلاش مجدد...';
-      if(d.type===Hls.ErrorTypes.NETWORK_ERROR){try{hls.startLoad();}catch(x){}}
-      else if(d.type===Hls.ErrorTypes.MEDIA_ERROR){try{hls.recoverMediaError();}catch(x){}}
-    }
-  });
-  qsel.onchange=function(){
-    hls.currentLevel=parseInt(qsel.value,10);
-    hls.loadLevel=parseInt(qsel.value,10);
-  };
-}else if(video.canPlayType('application/vnd.apple.mpegurl')){
-  video.src=src;
-  st.textContent='پخش نیتیو HLS';
-}else{
-  st.textContent='مرورگر پخش HLS را پشتیبانی نمی‌کند.';
-}
 video.addEventListener('loadedmetadata',function(){
   if(saved>5&&saved<video.duration-8){try{video.currentTime=saved;}catch(e){}}
 });
 video.addEventListener('timeupdate',function(){
   if(video.currentTime>3){try{localStorage.setItem(KEY,String(video.currentTime));}catch(e){}}
 });
+var MODE=${JSON.stringify(useHls ? 'hls' : 'fmt')};
+if(MODE==='hls'){
+  var src=${JSON.stringify('/yt/api/hls?u=' + encodeURIComponent(info.hls))};
+  function qs(list){
+    for(var i=0;i<list.length;i++){
+      var o=document.createElement('option');
+      o.value=String(i);
+      o.textContent=(list[i].height?list[i].height+'p':'سطح '+(i+1))+(list[i].bitrate?' · '+Math.round(list[i].bitrate/1000)+'kbps':'');
+      qsel.appendChild(o);
+    }
+  }
+  if(window.Hls&&Hls.isSupported()){
+    var hls=new Hls({maxBufferLength:60,backBufferLength:30,startLevel:-1});
+    hls.loadSource(src);
+    hls.attachMedia(video);
+    hls.on(Hls.Events.MANIFEST_PARSED,function(){
+      qs(hls.levels);
+      st.textContent='آماده پخش';
+    });
+    hls.on(Hls.Events.LEVEL_SWITCHED,function(e,d){
+      var lv=hls.levels[d.level];
+      if(lv&&lv.height)st.textContent='در حال پخش: '+lv.height+'p';
+    });
+    hls.on(Hls.Events.ERROR,function(e,d){
+      if(d.fatal){
+        st.textContent='خطا در بارگیری؛ در حال تلاش مجدد...';
+        if(d.type===Hls.ErrorTypes.NETWORK_ERROR){try{hls.startLoad();}catch(x){}}
+        else if(d.type===Hls.ErrorTypes.MEDIA_ERROR){try{hls.recoverMediaError();}catch(x){}}
+      }
+    });
+    qsel.onchange=function(){
+      hls.currentLevel=parseInt(qsel.value,10);
+      hls.loadLevel=parseInt(qsel.value,10);
+    };
+  }else if(video.canPlayType('application/vnd.apple.mpegurl')){
+    video.src=src;
+    st.textContent='پخش نیتیو HLS';
+  }else{
+    st.textContent='مرورگر پخش HLS را پشتیبانی نمی‌کند.';
+  }
+}else{
+  var srcs=${JSON.stringify(srcs)};
+  var cur=0;
+  for(var i=0;i<srcs.length;i++){
+    var o=document.createElement('option');
+    o.value=String(i);
+    o.textContent=srcs[i].q;
+    qsel.appendChild(o);
+  }
+  function playIdx(i){
+    cur=i;
+    var t=video.currentTime>3?video.currentTime:0;
+    video.src=srcs[i].u;
+    video.addEventListener('loadedmetadata',function once(){
+      video.removeEventListener('loadedmetadata',once);
+      if(t>0&&t<video.duration-5){try{video.currentTime=t;}catch(e){}}
+      video.play().catch(function(){});
+    });
+  }
+  if(srcs.length){playIdx(0);st.textContent='آماده پخش';}
+  else{st.textContent='فرمتی برای پخش پیدا نشد.';}
+  qsel.onchange=function(){playIdx(parseInt(qsel.value,10)||0);};
+}
 })();
 </script>`, target);
 }
