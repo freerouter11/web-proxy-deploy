@@ -1393,14 +1393,15 @@ function showIpPanel(){
     var sp=panelbox.querySelector('#ipLive');
     sp.textContent='در حال تست…';
     panelbox.querySelector('#ipMs').textContent='';
-    var t0=Date.now();
-    fetch(base+'/proxy?url='+encodeURIComponent('https://api.ipify.org/?format=json'),{cache:'no-store'})
-      .then(function(r){return r.text();})
-      .then(function(tx){
-        var ip='';
-        try{ip=(JSON.parse(tx).ip)||tx.slice(0,48);}catch(e){ip=tx.slice(0,48);}
-        sp.textContent=ip;
-        panelbox.querySelector('#ipMs').textContent=(Date.now()-t0)+' ms';
+    fetch(base+'/_ip/test',{cache:'no-store'})
+      .then(function(r){return r.json();})
+      .then(function(j){
+        if(j.ok){
+          sp.textContent=j.ip+(j.country?(' — '+j.country):'');
+          panelbox.querySelector('#ipMs').textContent=j.latency?(j.latency+' ms'):'';
+        } else {
+          sp.textContent=j.error||'تست ممکن نشد';
+        }
       })
       .catch(function(){sp.textContent='خطا در تست';});
   };

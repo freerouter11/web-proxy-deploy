@@ -317,34 +317,40 @@ async function refreshCandidateList(force) {
   } catch (_) { /* فهرست قبلی می‌ماند */ }
 }
 
+let poolCheckPromise = null; // اگر چند فراخوانی همزمان، همه منتظر همان بررسی بمانند
 async function healthCheckPool() {
-  if (!UNDICI || ipState.checking) return;
+  if (!UNDICI) return;
+  if (poolCheckPromise) return poolCheckPromise;
   ipState.checking = true;
-  try {
-    await refreshCandidateList(false);
-    const need = POOL_SIZE + 6 - ipState.pool.length;
-    if (need <= 0) return;
-    const known = new Set(ipState.pool.map((p) => p.url));
-    const fresh = ipState.candidates.filter((u) => !known.has(u));
-    const batch = fresh.slice(0, 90);
-    const ok = [];
-    let idx = 0;
-    const worker = async () => {
-      while (idx < batch.length && ok.length < POOL_SIZE + 4) {
-        const u = batch[idx++];
-        try { ok.push(await testProxy(u, 8000)); } catch (_) { /* پروکسی مرده */ }
-      }
-    };
-    await Promise.all(Array.from({ length: 10 }, worker));
-    const byUrl = new Map(ipState.pool.map((p) => [p.url, p]));
-    for (const p of ok) byUrl.set(p.url, p);
-    ipState.pool = [...byUrl.values()].sort((a, b) => a.latency - b.latency).slice(0, POOL_SIZE);
-  } finally {
-    ipState.checking = false;
-  }
+  poolCheckPromise = (async () => {
+    try {
+      await refreshCandidateList(false);
+      const need = POOL_SIZE + 6 - ipState.pool.length;
+      if (need <= 0) return;
+      const known = new Set(ipState.pool.map((p) => p.url));
+      const fresh = ipState.candidates.filter((u) => !known.has(u));
+      const batch = fresh.slice(0, 90);
+      const ok = [];
+      let idx = 0;
+      const worker = async () => {
+        while (idx < batch.length && ok.length < POOL_SIZE + 4) {
+          const u = batch[idx++];
+          try { ok.push(await testProxy(u, 8000)); } catch (_) { /* پروکسی مرده */ }
+        }
+      };
+      await Promise.all(Array.from({ length: 10 }, worker));
+      const byUrl = new Map(ipState.pool.map((p) => [p.url, p]));
+      for (const p of ok) byUrl.set(p.url, p);
+      ipState.pool = [...byUrl.values()].sort((a, b) => a.latency - b.latency).slice(0, POOL_SIZE);
+    } finally {
+      ipState.checking = false;
+      poolCheckPromise = null;
+    }
+  })();
+  return poolCheckPromise;
 }
 
-// چرخش به یک پروکسی سالمِ دیگر (تست تازه قبل از فعال‌سازی)
+// چرخش به یک پروکسی سالمِ دیگر (تست تازه قبل از فعال‌سازی؛ اولویت با سریع‌ها)
 async function rotateIp() {
   if (!UNDICI) throw new Error('ماژول undici در دسترس نیست؛ npm install را اجرا کن.');
   ipState.mode = 'pool';
@@ -353,15 +359,19 @@ async function rotateIp() {
     if (!ipState.pool.length) throw new Error('فعلاً هیچ پروکسی سالمی در استخر نیست؛ کمی بعد دوباره امتحان کن.');
   }
   const cur = ipState.active && ipState.active.url;
-  const order = ipState.pool.filter((p) => p.url !== cur);
-  for (let i = 0; i < Math.min(order.length, 6); i++) {
+  // استخر از قبل بر اساس سرعت مرتب است؛ تا ۶ نفر اول را تازه‌تست می‌کنیم
+  const order = ipState.pool.filter((p) => p.url !== cur).slice(0, 6);
+  let fallback = null;
+  for (const cand of order) {
     try {
-      ipState.active = await testProxy(order[i].url, 9000);
-      return ipState.active;
+      const t = await testProxy(cand.url, 9000);
+      if (t.latency <= 5000) { ipState.active = t; return ipState.active; }
+      if (!fallback || t.latency < fallback.latency) fallback = t;
     } catch (_) {
-      ipState.pool = ipState.pool.filter((p) => p.url !== order[i].url);
+      ipState.pool = ipState.pool.filter((p) => p.url !== cand.url);
     }
   }
+  if (fallback) { ipState.active = fallback; return ipState.active; }
   throw new Error('هیچ پروکسی سالمی پیدا نشد؛ کمی بعد دوباره امتحان کن.');
 }
 
@@ -723,21 +733,42 @@ async function handle(req, res) {
   }
 
   /* ---------- تغییر IP خروجی ---------- */
+  const IP_CORS = {
+    'content-type': 'application/json; charset=utf-8',
+    'cache-control': 'no-store',
+    'access-control-allow-origin': '*',
+    'access-control-allow-methods': 'GET, POST, OPTIONS',
+    'access-control-allow-headers': 'content-type',
+    'access-control-max-age': '86400',
+  };
+  if ((p === '/_ip' || p === '/_ip/rotate' || p === '/_ip/mode' || p === '/_ip/test') && req.method === 'OPTIONS') {
+    res.writeHead(204, IP_CORS);
+    return res.end();
+  }
   if (p === '/_ip') {
-    res.writeHead(200, {
-      'content-type': 'application/json; charset=utf-8',
-      'cache-control': 'no-store',
-      'access-control-allow-origin': '*',
-    });
+    res.writeHead(200, IP_CORS);
     return res.end(JSON.stringify(ipStatusJson()));
+  }
+  // تست زنده‌ی مسیر فعلی — از طریق همان مسیری که درخواست‌های پروکسی می‌روند
+  if (p === '/_ip/test') {
+    const out = { supported: !!UNDICI, mode: ipState.mode };
+    try {
+      const echo = UNDICI ? await ipEcho(activeDispatcher(), 12000)
+        : await (async () => { const t0 = Date.now(); const r = await fetch('https://api.ipify.org/?format=json', { signal: AbortSignal.timeout(12000) }); const j = await r.json(); return { ip: j.ip, country: '', cc: '', latency: Date.now() - t0 }; })();
+      out.ok = true; out.ip = echo.ip; out.country = echo.country; out.cc = echo.cc; out.latency = echo.latency;
+    } catch (e) {
+      out.ok = false; out.error = 'تست مسیر ممکن نشد؛ مسیر ممکن است قطع باشد.';
+    }
+    res.writeHead(200, IP_CORS);
+    return res.end(JSON.stringify(out));
   }
   if (p === '/_ip/rotate' && req.method === 'POST') {
     try {
       await rotateIp();
-      res.writeHead(200, { 'content-type': 'application/json; charset=utf-8', 'access-control-allow-origin': '*' });
+      res.writeHead(200, IP_CORS);
       return res.end(JSON.stringify({ ok: true, ...ipStatusJson() }));
     } catch (e) {
-      res.writeHead(503, { 'content-type': 'application/json; charset=utf-8', 'access-control-allow-origin': '*' });
+      res.writeHead(503, IP_CORS);
       return res.end(JSON.stringify({ ok: false, error: String(e && e.message || e), ...ipStatusJson() }));
     }
   }
@@ -755,12 +786,12 @@ async function handle(req, res) {
       proxyUrl = String(new URLSearchParams(raw).get('proxyUrl') || '').trim();
     }
     if (!['direct', 'pool', 'manual'].includes(mode)) {
-      res.writeHead(400, { 'content-type': 'application/json; charset=utf-8', 'access-control-allow-origin': '*' });
+      res.writeHead(400, IP_CORS);
       return res.end(JSON.stringify({ ok: false, error: 'mode باید direct یا pool یا manual باشد.' }));
     }
     if (mode === 'manual') {
       if (!/^https?:\/\/[\w.-]+:\d+$/.test(proxyUrl)) {
-        res.writeHead(400, { 'content-type': 'application/json; charset=utf-8', 'access-control-allow-origin': '*' });
+        res.writeHead(400, IP_CORS);
         return res.end(JSON.stringify({ ok: false, error: 'آدرس پروکسی باید به شکل http://host:port باشد.' }));
       }
       ipState.manualUrl = proxyUrl;
@@ -774,7 +805,7 @@ async function handle(req, res) {
       ipState.manualUrl = '';
     }
     ipState.mode = mode;
-    res.writeHead(200, { 'content-type': 'application/json; charset=utf-8', 'access-control-allow-origin': '*' });
+    res.writeHead(200, IP_CORS);
     return res.end(JSON.stringify({ ok: true, ...ipStatusJson() }));
   }
 
