@@ -118,8 +118,31 @@ async function doFetchStream(url, opts, ms) {
 
 const memCache = new Map(); // url -> {buf, headers, at}
 const CACHE_TYPES = /^(image\/|video\/|audio\/|font\/|text\/css|application\/javascript|text\/javascript|application\/octet-stream|application\/pdf)/i;
-const CACHE_MAX_BYTES = 96 * 1024 * 1024;
-const CACHE_ITEM_MAX = 24 * 1024 * 1024;
+
+/* بودجه‌ی کش تطبیقی (بازبینی برای پلن‌های رایگان کم‌رم):
+ * - اگر CACHE_MB داده شود همان اعمال می‌شود؛
+ * - وگرنه به‌اندازه‌ی سقف هیپ Node و سقف cgroup کانتینر محدود می‌شود
+ *   (مثلاً روی کانتینر ۲۵۶MB با هیپ ۱۹۲MB، کش ≈ ۶۷MB؛ روی ۵۱۲MB و هیپ ۳۸۴MB، ≈ ۹۶MB)
+ * تا روی پلن‌های رایگان (Render ۵۱۲MB / Back4App ۲۵۶MB) با OOM کرش نکند. */
+function detectMemoryBudgetBytes() {
+  const envMb = Number(process.env.CACHE_MB || 0);
+  if (envMb > 0) return Math.floor(envMb * 1024 * 1024);
+
+  let heapCap = 0;
+  const m = /max-old-space-size[=\s]+(\d+)/.exec(process.env.NODE_OPTIONS || '');
+  if (m) heapCap = Number(m[1]) * 1024 * 1024;
+  if (!heapCap) {
+    try {
+      const lim = fs.readFileSync('/sys/fs/cgroup/memory.max', 'utf8').trim(); // cgroup v2
+      if (/^\d+$/.test(lim) && Number(lim) > 0) heapCap = Math.floor(Number(lim) * 0.55);
+    } catch (_) { /* بدون cgroup */ }
+  }
+  const byHeap = heapCap > 0 ? Math.floor(heapCap * 0.35) : Infinity;
+  const DEFAULT = 96 * 1024 * 1024;
+  return Math.max(4 * 1024 * 1024, Math.min(DEFAULT, byHeap));
+}
+const CACHE_MAX_BYTES = detectMemoryBudgetBytes();
+const CACHE_ITEM_MAX = Math.min(24 * 1024 * 1024, Math.max(2 * 1024 * 1024, Math.floor(CACHE_MAX_BYTES / 4)));
 let cacheBytes = 0;
 
 function cacheGet(k) {
@@ -1077,6 +1100,7 @@ server.listen(PORT, () => {
   console.log('  آدرس محلی: http://localhost:' + PORT);
   console.log('  موتور سرعت: ' + (UNDICI ? 'undici (اتصال زنده ۶۰ث)' : 'fetch پیش‌فرض'));
   console.log('  تغییر IP خروجی: ' + (UNDICI ? 'فعال — مستقیم / چرخش خودکار / پروکسی دستی' : 'غیرفعال (undici نصب نیست)'));
+  console.log('  کش: حداکثر ' + Math.round(CACHE_MAX_BYTES / 1048576) + 'MB (آیتم: ' + Math.round(CACHE_ITEM_MAX / 1048576) + 'MB)');
   if (PASSWORD) console.log('  قفل رمز: فعال');
   else console.log('  هشدار: رمزی تنظیم نشده؛ برای سرور عمومی PROXY_PASSWORD را تنظیم کنید.');
 });

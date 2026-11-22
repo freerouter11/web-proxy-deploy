@@ -1490,20 +1490,51 @@ function showSettings(){
     var btn=this;btn.textContent='در حال تست…';btn.disabled=true;
     var list=settings.backends;
     var done=0;
-    list.forEach(function(b,i){
-      var sp=panelbox.querySelector('#ms'+i);if(sp)sp.textContent='…';
+    /* تست بیدار-آگاه: سرویس‌های رایگان (مثل Render) بعد از ۱۵ دقیقه بی‌کاری
+     * می‌خوابند و بیدار شدنشان تا ~۱ دقیقه طول می‌کشد؛ به‌جای «خطا»،
+     * «بیدار شدن…» نشان می‌دهیم و چند بار دوباره تلاش می‌کنیم.
+     * پاسخ باید متن «ok» باشد — صفحه‌ی لودینگ پلتفرم (HTML با کد ۲۰۰) رد می‌شود. */
+    function testOne(b,i,attempt){
+      var sp=panelbox.querySelector('#ms'+i);
       var t0=Date.now();
       var ctl=new AbortController();
-      var to=setTimeout(function(){ctl.abort();},6000);
+      var to=setTimeout(function(){ctl.abort();},9000);
       fetch(b.url+'/health',{cache:'no-store',signal:ctl.signal})
-       .then(function(){clearTimeout(to);var ms=Date.now()-t0;var sp2=panelbox.querySelector('#ms'+i);
-         if(sp2)sp2.textContent=ms+' ms';b.ms=ms;})
-       .catch(function(){clearTimeout(to);var sp2=panelbox.querySelector('#ms'+i);if(sp2)sp2.textContent='خطا';b.ms=99999;})
-       .then(function(){if(++done===list.length){btn.textContent='تست سرعت سرورها';btn.disabled=false;
-         var best=0;for(var x=0;x<list.length;x++)if((list[x].ms||99999)<(list[best].ms||99999))best=x;
-         if(list.length>1&&confirm('سریع‌ترین سرور: '+list[best].name+' — فعال شود؟')){
-           settings.active=best;saveSettings();showSettings();
-           if(active&&active.url)active.frame.src=proxyPath(active.url);}}});
+       .then(function(r){return r.text().then(function(txt){return {ok:r.ok&&txt==='ok'};});})
+       .then(function(r){
+         clearTimeout(to);
+         if(r.ok){
+           var ms=Date.now()-t0;var sp2=panelbox.querySelector('#ms'+i);
+           if(sp2)sp2.textContent=ms+' ms';b.ms=ms;return {fin:true};
+         }
+         throw new Error('bad');
+       })
+       .catch(function(){
+         clearTimeout(to);
+         if(attempt<4){ // تا ۴ بار با فاصله — بیدار شدن سرور خوابیده
+           var sp3=panelbox.querySelector('#ms'+i);
+           if(sp3)sp3.textContent='بیدار شدن… ('+(attempt+1)+'/۴)';
+           b.ms=99999;
+           setTimeout(function(){testOne(b,i,attempt+1);},9000);
+           return {fin:false};
+         }
+         var sp4=panelbox.querySelector('#ms'+i);if(sp4)sp4.textContent='خواب/خطا';b.ms=99999;
+         return {fin:true};
+       })
+       .then(function(res){
+         if(!res||!res.fin)return; /* تلاش مجدد در جریان است؛ شمارش نکن */
+         if(++done===list.length){btn.textContent='تست سرعت سرورها';btn.disabled=false;
+           var alive=list.filter(function(x){return (x.ms||99999)<99999;});
+           if(!alive.length){alert('هیچ سروری پاسخ نداد. اگر لایه رایگان است، ممکن است خوابیده باشد — دوباره تست بزن.');return;}
+           var best=0;for(var x=0;x<list.length;x++)if((list[x].ms||99999)<(list[best].ms||99999))best=x;
+           if(list.length>1&&confirm('سریع‌ترین سرور: '+list[best].name+' — فعال شود؟')){
+             settings.active=best;saveSettings();showSettings();
+             if(active&&active.url)active.frame.src=proxyPath(active.url);}}
+       });
+    }
+    list.forEach(function(b,i){
+      var sp=panelbox.querySelector('#ms'+i);if(sp)sp.textContent='…';
+      testOne(b,i,0);
     });
   };
   panelbox.querySelector('#engSel').onchange=function(){settings.engine=this.value;saveSettings();};

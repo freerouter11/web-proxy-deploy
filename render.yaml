@@ -1,4 +1,4 @@
-# تنظیمات دیپلوی روی Render — لایه‌ی Node با IP متفاوت از Cloudflare
+# تنظیمات دیپلوی روی Render — لایه‌ی ۴ (IP خروجی متفاوت از Cloudflare)
 # دکمه‌ی Deploy to Render: https://render.com/deploy?repo=https://github.com/freerouter11/web-proxy-deploy
 services:
   - type: web
@@ -8,5 +8,11 @@ services:
     region: frankfurt
     buildCommand: npm install
     startCommand: node server.js
-    healthCheckPath: /health
     autoDeploy: true
+    envVars:
+      # سقف هیپ مناسب پلن رایگان ۵۱۲MB — از OOM جلوگیری می‌کند
+      - key: NODE_OPTIONS
+        value: --max-old-space-size=384
+      # بودجه‌ی کش درون‌حافظه‌ای (محافظه‌کارانه برای پلن رایگان)
+      - key: CACHE_MB
+        value: "64"
