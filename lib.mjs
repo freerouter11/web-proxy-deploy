@@ -1,9 +1,11 @@
 /**
- * کتابخانه‌ی مشترک وب‌پروکسی — نسخه ۲ (مرورگر پروکسی حرفه‌ای)
+ * کتابخانه‌ی مشترک وب‌پروکسی — نسخه ۳٫۱ (پس از بازبینی انتقادی)
  *
  * این فایل بین نسخه‌ی Cloudflare Workers (worker.js) و نسخه‌ی
  * Node.js (server.js) مشترک است و شامل:
  *   - ابزارهای عمومی و صفحات پایه (ورود/خطا)
+ *   - محافظت SSRF سخت‌گیرانه (فرم‌های عددی IPv4، IPv6 نگاشته، ریدایرکت‌ها)
+ *   - جار کوکی «برای هر نشست» — کوکی‌های کاربران مختلف جدا از هم
  *   - موتور بازنویسی HTML/CSS + پچ سمت کلاینت (fetch/XHR/لینک‌های داینامیک)
  *   - پشتیبانی یوتیوب (Innertube API + پخش HLS)
  *   - رابط «مرورگر» با تب‌ها، تاریخچه، نشانک‌ها و سوییچ سرور
@@ -13,6 +15,7 @@
 
 const AUTH_COOKIE = 'px_auth';
 const ORIGIN_COOKIE = 'px_origin';
+const SID_COOKIE = 'px_sid';   // شناسه‌ی نشست هر مرورگر — کوکی‌ها و جار جدا برای هر کاربر
 const MAX_BODY = 10 * 1024 * 1024;     // حداکثر حجم بدنه‌ی درخواست (۱۰ مگابایت)
 const MAX_REWRITE = 15 * 1024 * 1024;  // حداکثر حجم بازنویسی HTML/CSS
 const UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36';
@@ -72,15 +75,142 @@ function normalizeTarget(t) {
   return 'https://' + t.replace(/^\/+/, '');
 }
 
-function isBlockedHost(hostname) {
-  const h = String(hostname || '').toLowerCase().replace(/^\[|\]$/g, '');
-  if (!h) return true;
-  if (h === 'localhost' || h.endsWith('.localhost') || h.endsWith('.local') || h.endsWith('.internal') || h.endsWith('.lan')) return true;
-  if (/^(127\.|10\.|192\.168\.|169\.254\.|0\.)/.test(h)) return true;
-  if (/^172\.(1[6-9]|2\d|3[01])\./.test(h)) return true;
-  if (/^100\.(6[4-9]|[7-9]\d|1[01]\d|12[0-7])\./.test(h)) return true;
-  if (h === '::1' || h === '::' || h.startsWith('fc') || h.startsWith('fd') || h.startsWith('fe80')) return true;
+function _ipv4ToInt(h) {
+  const p = h.split('.');
+  if (p.length !== 4) return null;
+  let n = 0;
+  for (const part of p) {
+    if (!/^\d{1,3}$/.test(part)) return null;
+    const v = Number(part);
+    if (v > 255) return null;
+    n = n * 256 + v;
+  }
+  return n >>> 0;
+}
+
+function _isPrivateIpv4(n) {
+  const a = (n >>> 24) & 255, b = (n >>> 16) & 255;
+  if (a === 0 || a === 10 || a === 127) return true;          // 0/8، 10/8، loopback
+  if (a === 169 && b === 254) return true;                     // link-local (شامل 169.254.169.254 ابر)
+  if (a === 172 && b >= 16 && b <= 31) return true;            // 172.16/12
+  if (a === 192 && b === 168) return true;                     // 192.168/16
+  if (a === 100 && b >= 64 && b <= 127) return true;           // CGNAT 100.64/10
+  if (a === 192 && b === 0) return true;                       // 192.0.0/24 و 192.0.2/24
+  if (a === 198 && (b === 18 || b === 19)) return true;        // بنچمارک
+  if (a >= 224) return true;                                   // multicast و رزروشده
   return false;
+}
+
+/**
+ * محافظت SSRF — نسخه‌ی سخت‌گیرانه.
+ * ایراد نسخه‌ی قبلی: فرم‌های عددی IPv4 (مثل http://2130706433 = 127.0.0.1)،
+ * هگز/اکتال، و IPv6 نگاشته (::ffff:127.0.0.1) از دست رد می‌شدند.
+ * الان همه با نرمال‌سازی WHATWG URL + بازرسی دقیق بازه‌ها بلاک می‌شوند.
+ */
+function isBlockedHost(hostname) {
+  let h = String(hostname || '').toLowerCase().trim().replace(/^\[|\]$/g, '');
+  if (!h) return true;
+  if (h === 'localhost' || h.endsWith('.localhost') || h.endsWith('.local') ||
+      h.endsWith('.internal') || h.endsWith('.lan') || h.endsWith('.home') || h.endsWith('.arpa')) return true;
+  // نرمال‌سازی فرم‌های عددی IPv4 (2130706433، 0x7f.1، 0177.0.0.1 و…) با پارسر WHATWG
+  try {
+    const u = h.includes(':') ? new URL('http://[' + h + ']/') : new URL('http://' + h + '/');
+    const norm = u.hostname.toLowerCase().replace(/^\[|\]$/g, '');
+    if (norm && norm !== h) h = norm;
+  } catch (_) { return true; } // بدشکل → بلاک
+  const v4 = _ipv4ToInt(h);
+  if (v4 !== null) return _isPrivateIpv4(v4);
+  if (h.includes(':')) { // IPv6
+    if (h === '::' || h === '::1') return true;
+    if (h.startsWith('::ffff:')) {                    // نگاشت IPv4
+      const tail = h.slice(7);
+      const m = _ipv4ToInt(tail);
+      if (m !== null) return _isPrivateIpv4(m);
+      return true;                                    // فرم hex نگاشت هم بلاک
+    }
+    if (/^f[cd]/.test(h)) return true;                // ULA fc00::/7
+    if (/^fe[89ab]/.test(h)) return true;             // link-local fe80::/10
+    if (/^ff/.test(h)) return true;                   // multicast
+    if (/^2001:db8/.test(h)) return true;             // مستندسازی
+    if (h.startsWith('64:ff9b:')) return true;        // NAT64 — قابل سوءاستفاده برای دور زدن
+    return false;
+  }
+  if (/^\d+$/.test(h)) return true; // عدد بدون نقطه که تا اینجا نرمال نشده → مشکوک
+  return false;
+}
+
+/* ------------------- جار کوکی «برای هر نشست» -------------------
+ * ایراد جدی نسخه‌های قبلی: کوکی‌های همه‌ی کاربران در یک ظرفِ مشترکِ
+ * «بر اساس مبدأ» نگه داشته می‌شد؛ یعنی اگر کاربر الف وارد سایتی شود،
+ * کاربر ب با نشستِ الف آن سایت را می‌دید — روی استقرار عمومی فاجعه است.
+ * الان هر مرورگر یک px_sid می‌گیرد و ظرف کوکی‌ها جدا است.
+ * پشتیبانی از Domain= هم اضافه شد (ورود بین زیردامنه‌ها).
+ */
+function createCookieJar(limit) {
+  const MAX = limit || 4000;
+  const jar = new Map(); // "sid\u0000scope" -> Map(name -> value)
+  const kOf = (sid, scope) => sid + '\u0000' + scope;
+  function bucket(sid, scope) {
+    const k = kOf(sid, scope);
+    let b = jar.get(k);
+    if (!b) {
+      b = new Map();
+      if (jar.size >= MAX) {
+        const drop = Math.ceil(MAX / 8);
+        let i = 0;
+        for (const k2 of jar.keys()) { jar.delete(k2); if (++i >= drop) break; }
+      }
+      jar.set(k, b);
+    }
+    return b;
+  }
+  function add(sid, origin, setCookies) {
+    if (!sid || !setCookies || !setCookies.length) return;
+    let host = '';
+    try { host = new URL(origin).hostname.toLowerCase(); } catch (_) { return; }
+    for (const sc of setCookies) {
+      const parts = String(sc).split(';');
+      const pair = parts[0];
+      const eq = pair.indexOf('=');
+      if (eq <= 0) continue;
+      const name = pair.slice(0, eq).trim();
+      const value = pair.slice(eq + 1).trim();
+      let domain = '';
+      for (const attr of parts.slice(1)) {
+        const m = /^\s*domain\s*=\s*(.+)/i.exec(attr);
+        if (m) domain = m[1].trim().toLowerCase().replace(/^\.+/, '');
+      }
+      const exp = /expires\s*=\s*([^;]+)/i.exec(sc);
+      const expired = exp ? (new Date(exp[1]).getTime() || 0) <= Date.now() : false;
+      const scope = domain ? 'd:' + domain : 'o:' + origin;
+      if (expired || /^\s*deleted\s*$/i.test(value)) {
+        const b = jar.get(kOf(sid, scope));
+        if (b) b.delete(name);
+        continue;
+      }
+      if (domain && !(host === domain || host.endsWith('.' + domain))) continue; // دامنه‌ی جعلی
+      const b = bucket(sid, scope);
+      b.set(name, value);
+      if (b.size > 80) b.delete(b.keys().next().value);
+    }
+  }
+  function cookie(sid, origin) {
+    if (!sid) return null;
+    let host = '';
+    try { host = new URL(origin).hostname.toLowerCase(); } catch (_) { return null; }
+    const out = new Map();
+    const ob = jar.get(kOf(sid, 'o:' + origin));
+    if (ob) for (const [k, v] of ob) out.set(k, v);
+    let p = host;
+    while (p.includes('.')) {
+      const db = jar.get(kOf(sid, 'd:' + p));
+      if (db) for (const [k, v] of db) if (!out.has(k)) out.set(k, v);
+      p = p.slice(p.indexOf('.') + 1);
+    }
+    if (!out.size) return null;
+    return [...out].map(([k, v]) => k + '=' + v).join('; ');
+  }
+  return { add, cookie };
 }
 
 /* ------------------------- CSS پایه‌ی صفحات ------------------------- */
@@ -132,11 +262,12 @@ ${bodyHtml}
 </html>`;
 }
 
-function loginPage(err) {
+function loginPage(err, msg) {
+  const errText = typeof err === 'string' ? err : (msg || (err ? 'رمز درست نبود، دوباره امتحان کن.' : ''));
   return page('ورود به وب‌پروکسی', `
 <h1>ورود</h1>
 <p class="sub">این پروکسی با رمز محافظت می‌شود. برای ادامه رمز را وارد کن.</p>
-${err ? '<p class="err">رمز درست نبود، دوباره امتحان کن.</p>' : ''}
+${errText ? '<p class="err">' + esc(errText) + '</p>' : ''}
 <form method="post" action="/login" class="row">
   <input type="password" name="password" placeholder="رمز عبور" autofocus>
   <button type="submit">ورود</button>
@@ -402,7 +533,10 @@ async function innertube(endpoint, body, key, ua, extra) {
     'cookie': (extra && extra.cookie) || 'SOCS=CAI',
     'origin': 'https://www.youtube.com',
   };
-  const r = await fetch('https://www.youtube.com/youtubei/v1/' + endpoint + '?key=' + key + '&prettyPrint=false', {
+  // قلاب fetcher: سرور Node می‌تواند undici با dispatcher بدهد تا یوتیوب هم
+  // از اتصال زنده و «حالت تغییر IP» عبور کند (نسخه‌ی قبلی از fetch خام می‌رفت).
+  const f = (extra && extra.fetch) || fetch;
+  const r = await f('https://www.youtube.com/youtubei/v1/' + endpoint + '?key=' + key + '&prettyPrint=false', {
     method: 'POST',
     headers,
     body: JSON.stringify(body),
@@ -486,14 +620,14 @@ async function ytPlayerInfo(videoId, opts) {
       d = await innertube('player', {
         context: { client: YT_IOS_CLIENT },
         videoId, contentCheckOk: true, racyCheckOk: true,
-      }, YT_IOS_KEY, YT_IOS_UA, { cookie: opts.cookie });
+      }, YT_IOS_KEY, YT_IOS_UA, { cookie: opts.cookie, fetch: opts.fetch });
     } catch (_) { d = null; }
   }
   if (!d) {
     d = await innertube('player', {
       context: { client: YT_IOS_CLIENT },
       videoId, contentCheckOk: true, racyCheckOk: true,
-    }, YT_IOS_KEY, YT_IOS_UA);
+    }, YT_IOS_KEY, YT_IOS_UA, { fetch: opts.fetch });
   }
   let status = ((d.playabilityStatus || {}).status) || '';
   let sd = d.streamingData || {};
@@ -503,7 +637,7 @@ async function ytPlayerInfo(videoId, opts) {
       const d2 = await innertube('player', {
         context: { client: YT_WEB_CLIENT },
         videoId, contentCheckOk: true, racyCheckOk: true,
-      }, YT_WEB_KEY, opts.ua || UA, { cookie: opts.cookie });
+      }, YT_WEB_KEY, opts.ua || UA, { cookie: opts.cookie, fetch: opts.fetch });
       const st2 = ((d2.playabilityStatus || {}).status) || '';
       const sd2 = (d2.streamingData || {});
       const hasUrl = ((sd2.formats || []).some((f) => f.url)) || sd2.hlsManifestUrl;
@@ -540,25 +674,27 @@ async function ytPlayerInfo(videoId, opts) {
   return info;
 }
 
-async function ytSearch(q) {
+async function ytSearch(q, opts) {
+  opts = opts || {};
   const ck = 'search:' + q;
   const cached = memGet(ck, 5 * 60 * 1000);
   if (cached) return cached;
   const d = await innertube('search', {
     context: { client: YT_WEB_CLIENT }, query: q,
-  }, YT_WEB_KEY, UA);
+  }, YT_WEB_KEY, UA, { fetch: opts.fetch });
   const videos = collectVideos(d).slice(0, 30);
   if (videos.length) memSet(ck, videos);
   return videos;
 }
 
-async function ytPlaylist(listId) {
+async function ytPlaylist(listId, opts) {
+  opts = opts || {};
   const ck = 'playlist:' + listId;
   const cached = memGet(ck, 10 * 60 * 1000);
   if (cached) return cached;
   const d = await innertube('browse', {
     context: { client: YT_WEB_CLIENT }, browseId: 'VL' + listId,
-  }, YT_WEB_KEY, UA);
+  }, YT_WEB_KEY, UA, { fetch: opts.fetch });
   const videos = collectVideos(d).slice(0, 100);
   if (videos.length) memSet(ck, videos);
   return videos;
@@ -1095,6 +1231,14 @@ tabsEl.addEventListener('click',function(e){
 el('newtab').addEventListener('click',function(){newTab(true);});
 /* ---------- ناوبری ---------- */
 function proxyPath(target){return backend()+'/proxy?url='+encodeURIComponent(target);}
+/* فراخوانی API پنل IP روی سرورِ فعال — اگر سرور فعال روی مبدأ دیگری است،
+   درخواست از مسیر پروکسیِ همین مبدأ می‌رود تا مقصد به هدر Origin حساس نباشد
+   و سایت‌های دیگر هم نتوانند حالت خروجی سرور را عوض کنند. */
+function ipFetch(path,opts){
+  var b=backend();
+  try{if(new URL(b).origin===location.origin)return fetch(path,opts||{});}catch(e){}
+  return fetch('/proxy?url='+encodeURIComponent(b+path),opts||{});
+}
 function setAddr(u){addrEl.value=u||'';}
 function smartUrl(v){
   v=v.trim();
@@ -1393,7 +1537,7 @@ function showIpPanel(){
     var sp=panelbox.querySelector('#ipLive');
     sp.textContent='در حال تست…';
     panelbox.querySelector('#ipMs').textContent='';
-    fetch(base+'/_ip/test',{cache:'no-store'})
+    ipFetch('/_ip/test',{cache:'no-store'})
       .then(function(r){return r.json();})
       .then(function(j){
         if(j.ok){
@@ -1405,7 +1549,7 @@ function showIpPanel(){
       })
       .catch(function(){sp.textContent='خطا در تست';});
   };
-  fetch(base+'/_ip',{cache:'no-store'}).then(function(r){return r.ok?r.json():null;}).then(function(st){
+  ipFetch('/_ip',{cache:'no-store'}).then(function(r){return r.ok?r.json():null;}).then(function(st){
     if(!st||!st.supported){
       panelbox.querySelector('#ipBox').innerHTML=
         '<p class="tiny" style="color:#fbbf24">⚠ این سرور از تغییر IP پشتیبانی نمی‌کند (لایه‌ی Cloudflare).</p>'
@@ -1437,7 +1581,7 @@ function showIpPanel(){
         +'<p class="tiny">هر بار «گرفتن IP جدید» یک پروکسی سالمِ دیگر فعال می‌شود. پروکسی‌های رایگان کندتر از مسیر مستقیم‌اند؛ بعد از تمام شدن کار برگرد به حالت مستقیم.</p>';
         panelbox.querySelector('#ipRot').onclick=function(){
           var b=this;b.disabled=true;b.textContent='در حال جستجوی پروکسی سالم… (تا ۱ دقیقه)';
-          fetch(base+'/_ip/rotate',{method:'POST'}).then(function(r){return r.json();}).then(function(j){
+          ipFetch('/_ip/rotate',{method:'POST'}).then(function(r){return r.json();}).then(function(j){
             if(j.ok&&j.active){
               renderIpCtl(j);
               var live=panelbox.querySelector('#ipLive');if(live)live.textContent=j.active.ip;
@@ -1453,7 +1597,7 @@ function showIpPanel(){
         +'<p class="tiny">آدرس پروکسی شخصی‌ات را بده (مثلاً پروکسی چرخشی خریداری‌شده). همه‌ی ترافیک از آن می‌گذرد.</p>';
         panelbox.querySelector('#ipSetM').onclick=function(){
           var u=panelbox.querySelector('#ipUrl').value.trim();
-          fetch(base+'/_ip/mode',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({mode:'manual',proxyUrl:u})})
+          ipFetch('/_ip/mode',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({mode:'manual',proxyUrl:u})})
             .then(function(r){return r.json();}).then(function(j){
               if(j.ok){renderIpCtl(j);alert('پروکسی شخصی فعال شد.');}
               else{alert(j.error||'پروکسی فعال نشد.');}
@@ -1464,7 +1608,7 @@ function showIpPanel(){
     panelbox.querySelectorAll('input[name=ipm]').forEach(function(r){
       r.addEventListener('change',function(){
         var m=this.value;
-        fetch(base+'/_ip/mode',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({mode:m})})
+        ipFetch('/_ip/mode',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({mode:m})})
           .then(function(r2){return r2.json();}).then(function(j){if(j.ok)renderIpCtl(j);})
           .catch(function(){alert('تغییر حالت ممکن نشد.');});
       });
@@ -1725,8 +1869,8 @@ document.getElementById('sf').addEventListener('submit',function(e){
 /* ---------------------------- صادر کردن‌ها ---------------------------- */
 
 export {
-  AUTH_COOKIE, ORIGIN_COOKIE, MAX_BODY, MAX_REWRITE, UA, STRIP_HEADERS,
-  esc, parseCookies, fmtViews, fmtDur, normalizeTarget, isBlockedHost,
+  AUTH_COOKIE, ORIGIN_COOKIE, SID_COOKIE, MAX_BODY, MAX_REWRITE, UA, STRIP_HEADERS,
+  esc, parseCookies, fmtViews, fmtDur, normalizeTarget, isBlockedHost, createCookieJar,
   page, loginPage, errorPage, notFoundPage, faviconResponse,
   proxiedPath, rewriteHtml, rewriteCss, CLIENT_PATCH,
   innertube, ytPlayerInfo, ytSearch, ytPlaylist, ytRouteFor, hlsRewrite, isGooglevideo,

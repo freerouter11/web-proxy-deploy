@@ -1,33 +1,32 @@
 #!/usr/bin/env node
 /**
- * وب‌پروکسی شخصی — نسخه Node.js (۳)
+ * وب‌پروکسی شخصی — نسخه Node.js (۳٫۱ — پس از بازبینی انتقادی)
  *
- * مرورگر پروکسی حرفه‌ای با همان قابلیت‌های نسخه‌ی Cloudflare:
- * تب‌ها، تاریخچه، نشانک‌ها، سوییچ سرور، پشتیبانی یوتیوب (HLS)،
- * کش درون‌حافظه‌ای و — جدید در نسخه ۳ — **تغییر IP خروجی**.
- *
- * ویژگی‌ها:
- *   - رابط «مرورگر» کامل + بازنویسی لینک‌ها/تصاویر/فرم‌ها
- *   - پچ سمت کلاینت: fetch/XHR/لینک‌های داینامیک هم از پروکسی رد می‌شوند
- *   - نگه‌داشتن کوکی‌های سایت مقصد در حافظه (ورود به سایت‌ها)
- *   - موتور سرعت undici: اتصال‌های زنده، استریم فوری + کش موازی
- *   - تغییر IP خروجی: استخر پروکسی رایگان، چرخش خودکار/دستی، پروکسی شخصی
- *
- * اجرا:  node server.js
+ * اصلاحات این نسخه:
+ *   - نشست جدا برای هر مرورگر (px_sid): کوکی‌های سایت مقصد دیگر بین کاربران مشترک نیست
+ *   - محافظت SSRF کامل: فرم‌های عددی IPv4، IPv6 نگاشته، ریدایرکت به آدرس داخلی،
+ *     و بررسی DNS (دامنه‌ای که به IP خصوصی resolve می‌شود بلاک است)
+ *   - قفل API تغییر IP روی Origin (سایت‌های دیگر نمی‌توانند حالت خروجی را عوض کنند)
+ *   - رفع باگ قطع‌شدن صفحات بزرگ‌تر از ۱۵MB (لغو ناخواسته‌ی استریم)
+ *   - محدودیت نرخ درخواست (ضد سوءاستفاده در حالت بدون رمز) + قفل تلاش‌های ورود
+ *   - کش LRU واقعی + رفع دوبار شمارش حجم هنگام بازنویسی کلید
+ *   - پشتیبانی از پروکسی شخصی با احراز هویت (user:pass@host:port) + ماسک شدن رمز
+ *   - تشخیص charset از <meta> وقتی هدر ندارد؛ فهرست پروکسی با چند منبع پشتیبان
  */
 
 'use strict';
 
 import http from 'node:http';
 import crypto from 'node:crypto';
+import dns from 'node:dns/promises';
 import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { Readable } from 'node:stream';
 
 import {
-  AUTH_COOKIE, ORIGIN_COOKIE, MAX_BODY, MAX_REWRITE, UA, STRIP_HEADERS,
-  esc, parseCookies, normalizeTarget, isBlockedHost,
+  AUTH_COOKIE, ORIGIN_COOKIE, SID_COOKIE, MAX_BODY, MAX_REWRITE, UA, STRIP_HEADERS,
+  esc, parseCookies, normalizeTarget, isBlockedHost, createCookieJar,
   page, loginPage, errorPage, notFoundPage,
   rewriteHtml, rewriteCss,
   ytPlayerInfo, ytSearch, ytPlaylist, ytRouteFor, hlsRewrite, isGooglevideo,
@@ -61,6 +60,8 @@ const PORT = Number(process.env.PORT || 3000);
 const PASSWORD = String(process.env.PROXY_PASSWORD || '').trim();
 const ALLOW_PRIVATE = String(process.env.ALLOW_PRIVATE || '').toLowerCase() === 'true';
 const TIMEOUT_MS = Number(process.env.PROXY_TIMEOUT_MS || 30000);
+const RATE_LIMIT = Number(process.env.RATE_LIMIT_PER_MIN || 300);   // 0 = بی‌نهایت
+const IP_RATE_LIMIT = Number(process.env.IP_API_LIMIT_PER_MIN || 30);
 const SECRET = crypto.randomBytes(32);
 const HLS_JS = (() => {
   try { return fs.readFileSync(path.join(__dirname, 'hls.min.js'), 'utf8'); }
@@ -125,16 +126,19 @@ function cacheGet(k) {
   const e = memCache.get(k);
   if (!e) return null;
   if (Date.now() - e.at > e.ttl * 1000) { memCache.delete(k); cacheBytes -= e.buf.length; return null; }
+  // LRU واقعی: تازه‌سازی ترتیب درج (ایراد قبلی: فقط FIFO بود)
+  memCache.delete(k); memCache.set(k, e);
   return e;
 }
 
 function cachePut(k, buf, ctype, ttl) {
   if (buf.length > CACHE_ITEM_MAX) return;
-  if (cacheBytes + buf.length > CACHE_MAX_BYTES) {
-    for (const [key, e] of memCache) {
-      memCache.delete(key); cacheBytes -= e.buf.length;
-      if (cacheBytes + buf.length <= CACHE_MAX_BYTES) break;
-    }
+  const old = memCache.get(k);
+  if (old) cacheBytes -= old.buf.length; // ایراد قبلی: بافر قبلی کنار می‌ماند ولی حجمش دوبار حساب می‌شد
+  while (cacheBytes + buf.length > CACHE_MAX_BYTES && memCache.size) {
+    const first = memCache.keys().next().value;
+    cacheBytes -= memCache.get(first).buf.length;
+    memCache.delete(first);
   }
   memCache.set(k, { buf, ctype, at: Date.now(), ttl });
   cacheBytes += buf.length;
@@ -173,31 +177,91 @@ function readBody(req, limit) {
   });
 }
 
-/* ---------------------- جار کوکی (حافظه‌ای) ---------------------- */
+/* ---------------------- نشست هر مرورگر + جار کوکی ----------------------
+ * ایراد امنیتی نسخه‌ی قبل: یک جار مشترک برای همه‌ی کاربران → لو رفتن نشست‌ها.
+ * الان هر مرورگر یک px_sid (HttpOnly) می‌گیرد و کوکی‌ها فقط برای خودش نگه
+ * داشته می‌شوند. کوکی‌های Domain= هم روی زیردامنه‌ها کار می‌کنند.
+ */
+const jar = createCookieJar(6000);
 
-const cookieJar = new Map(); // origin -> Map(name -> value)
-
-function jarAdd(origin, setCookies) {
-  if (!setCookies || !setCookies.length) return;
-  let bucket = cookieJar.get(origin);
-  if (!bucket) { bucket = new Map(); cookieJar.set(origin, bucket); }
-  for (const sc of setCookies) {
-    const pair = String(sc).split(';')[0];
-    const i = pair.indexOf('=');
-    if (i <= 0) continue;
-    const name = pair.slice(0, i).trim();
-    const value = pair.slice(i + 1).trim();
-    const exp = /expires\s*=\s*([^;]+)/i.exec(sc);
-    if (exp && new Date(exp[1]).getTime() <= Date.now()) bucket.delete(name);
-    else if (!/^\s*deleted\s*$/i.test(value)) bucket.set(name, value);
-    if (bucket.size > 80) bucket.delete(bucket.keys().next().value);
-  }
+function sidOf(req) {
+  const s = parseCookies(req.headers.cookie)[SID_COOKIE];
+  return /^[a-f0-9]{32}$/.test(s || '') ? s : '';
 }
 
-function jarCookie(origin) {
-  const bucket = cookieJar.get(origin);
-  if (!bucket || !bucket.size) return null;
-  return [...bucket].map(([k, v]) => k + '=' + v).join('; ');
+function newSid() { return crypto.randomBytes(16).toString('hex'); }
+
+/* ------------------- محدودیت نرخ (ضد سوءاستفاده) ------------------- */
+
+const buckets = new Map(); // ip|zone -> {t, n}
+function rateLimited(ip, zone, limit) {
+  if (!limit) return false;
+  const k = zone + '|' + ip;
+  const now = Date.now();
+  let b = buckets.get(k);
+  if (!b || now - b.t >= 60000) {
+    b = { t: now, n: 0 };
+    buckets.set(k, b);
+    if (buckets.size > 12000) {
+      let i = 0;
+      for (const kk of buckets.keys()) { buckets.delete(kk); if (++i >= 6000) break; }
+    }
+  }
+  b.n++;
+  return b.n > limit;
+}
+
+function clientIp(req) {
+  const xff = req.headers['x-forwarded-for'];
+  if (typeof xff === 'string' && xff) return xff.split(',')[0].trim();
+  return req.socket.remoteAddress || '?';
+}
+
+/* تلاش‌های ورود ناموفق — ۸ تلاش در ۱۰ دقیقه برای هر IP */
+const loginFails = new Map();
+function loginLimited(ip) {
+  const e = loginFails.get(ip);
+  if (!e) return false;
+  if (Date.now() - e.at > 10 * 60 * 1000) { loginFails.delete(ip); return false; }
+  return e.n >= 8;
+}
+function noteLoginFail(ip) {
+  const e = loginFails.get(ip) || { n: 0, at: Date.now() };
+  e.n++; e.at = Date.now();
+  loginFails.set(ip, e);
+  if (loginFails.size > 5000) { let i = 0; for (const k of loginFails.keys()) { loginFails.delete(k); if (++i >= 2500) break; } }
+}
+
+/* مقایسه‌ی زمان-ثابت رمز (ضد timing attack) */
+function safeEqual(a, b) {
+  const ha = crypto.createHash('sha256').update(String(a)).digest();
+  const hb = crypto.createHash('sha256').update(String(b)).digest();
+  return crypto.timingSafeEqual(ha, hb);
+}
+
+/* ------------------- محافظت DNS (ضد DNS-rebinding ساده) -------------------
+ * اگر دامنه‌ای به IP خصوصی resolve شود (حتی اگر نامش بی‌ضرر باشد) بلاک می‌شود.
+ * نتیجه‌ها ۱۰ دقیقه کش می‌شوند تا هزینه‌ی تأخیر تقریباً صفر باشد.
+ */
+const dnsOkCache = new Map(); // host -> {ok, at}
+async function egressAllowed(hostname) {
+  if (ALLOW_PRIVATE) return true;
+  const h = String(hostname || '').toLowerCase().replace(/^\[|\]$/g, '');
+  if (!h) return false;
+  if (isBlockedHost(h)) return false;
+  if (!h.includes('.') || /^\d+\.\d+\.\d+\.\d+$/.test(h)) return true; // IP literal — بالا بررسی شد
+  let e = dnsOkCache.get(h);
+  if (!e || Date.now() - e.at > 10 * 60 * 1000) {
+    let ok = true;
+    try {
+      const addrs = await dns.lookup(h, { all: true });
+      if (addrs.length && addrs.some((a) => isBlockedHost(a.address))) ok = false;
+    } catch (_) { /* resolve نشد → fetch خودش خطا می‌دهد؛ عبور */ }
+    e = { ok, at: Date.now() };
+    if (dnsOkCache.size > 3000) { let i = 0; for (const k of dnsOkCache.keys()) { dnsOkCache.delete(k); if (++i >= 1500) break; } }
+    dnsOkCache.set(h, e);
+  }
+  return e.ok;
 }
 
 /* ------------------- موتور تغییر IP خروجی ------------------- */
@@ -207,8 +271,13 @@ function jarCookie(origin) {
 //   pool   → چرخش بین پروکسی‌های رایگان سالم (برای دور زدن بلاک IP)
 //   manual → پروکسی شخصی که خودت می‌دهی (مثلاً پروکسی چرخشی خریداری‌شده)
 
-const PROXY_LIST_URL = String(process.env.PROXY_LIST_URL ||
-  'https://raw.githubusercontent.com/monosans/proxy-list/main/proxies/http.txt').trim();
+// منابع فهرست پروکسی — اگر یکی پایین بود، بعدی امتحان می‌شود (ایراد قبلی: تک‌منبع بود)
+const PROXY_LIST_URLS = [
+  process.env.PROXY_LIST_URL,
+  'https://raw.githubusercontent.com/monosans/proxy-list/main/proxies/http.txt',
+  'https://raw.githubusercontent.com/TheSpeedX/PROXY-List/master/http.txt',
+  'https://raw.githubusercontent.com/proxifly/free-proxy-list/main/proxies/protocols/http/data.txt',
+].filter(Boolean).map((u) => u.trim()).filter((v, i, a) => a.indexOf(v) === i);
 const POOL_SIZE = Math.min(Math.max(Number(process.env.POOL_SIZE || 20) || 20, 4), 60);
 const IP_CHECK_EVERY = 10 * 60 * 1000; // نوسازی استخر هر ۱۰ دقیقه
 
@@ -260,6 +329,7 @@ function activeDispatcher() {
 
 // «آینه IP» — از مسیر داده‌شده می‌پرسد IP و کشور ما چیست
 async function ipEcho(dispatcher, timeoutMs) {
+  if (!UNDICI) throw new Error('undici در دسترس نیست');
   const t0 = Date.now();
   let j = null;
   try {
@@ -292,29 +362,33 @@ async function testProxy(u, timeoutMs) {
 async function refreshCandidateList(force) {
   const now = Date.now();
   if (!force && ipState.candidates.length && now - ipState.lastListAt < IP_CHECK_EVERY) return;
-  try {
-    const r = await doFetch(PROXY_LIST_URL, {
-      headers: { 'user-agent': UA },
-      signal: AbortSignal.timeout(20000),
-    });
-    const text = await r.text();
-    const seen = new Set();
-    const list = [];
-    for (let line of text.split(/\r?\n/)) {
-      line = line.trim();
-      if (/^[\w.-]+:\d+$/.test(line) && !seen.has(line)) {
-        seen.add(line);
-        list.push('http://' + line);
-      }
-      if (list.length >= 160) break;
+  let text = '';
+  for (const listUrl of PROXY_LIST_URLS) {
+    try {
+      const r = await doFetch(listUrl, {
+        headers: { 'user-agent': UA },
+        signal: AbortSignal.timeout(20000),
+      });
+      if (r.ok) { text = await r.text(); if (text.trim()) break; }
+    } catch (_) { /* منبع بعدی */ }
+  }
+  if (!text.trim()) return; // فهرست قبلی می‌ماند
+  const seen = new Set();
+  const list = [];
+  for (let line of text.split(/\r?\n/)) {
+    line = line.trim();
+    if (/^[\w.-]+:\d+$/.test(line) && !seen.has(line)) {
+      seen.add(line);
+      list.push('http://' + line);
     }
-    for (let i = list.length - 1; i > 0; i--) {
-      const j = Math.floor(Math.random() * (i + 1));
-      [list[i], list[j]] = [list[j], list[i]];
-    }
-    ipState.candidates = list;
-    ipState.lastListAt = now;
-  } catch (_) { /* فهرست قبلی می‌ماند */ }
+    if (list.length >= 160) break;
+  }
+  for (let i = list.length - 1; i > 0; i--) {
+    const j = Math.floor(Math.random() * (i + 1));
+    [list[i], list[j]] = [list[j], list[i]];
+  }
+  ipState.candidates = list;
+  ipState.lastListAt = now;
 }
 
 let poolCheckPromise = null; // اگر چند فراخوانی همزمان، همه منتظر همان بررسی بمانند
@@ -386,11 +460,15 @@ function noteRouteFailure() {
   }
 }
 
+function maskProxyUrl(u) {
+  return String(u || '').replace(/\/\/([^:@\/\s]+):[^@\s]*@/, '//$1:***@');
+}
+
 function ipStatusJson() {
   return {
     supported: !!UNDICI,
     mode: ipState.mode,
-    manualUrl: ipState.manualUrl,
+    manualUrl: maskProxyUrl(ipState.manualUrl), // رمز پروکسی شخصی هرگز فاش نمی‌شود
     direct: ipState.directInfo,
     active: ipState.active ? {
       url: ipState.active.url, ip: ipState.active.ip,
@@ -423,7 +501,7 @@ const FWD_HEADERS = ['sec-ch-ua', 'sec-ch-ua-mobile', 'sec-ch-ua-platform',
   'sec-ch-ua-platform-version', 'sec-ch-ua-full-version-list', 'sec-ch-ua-model', 'sec-ch-ua-arch',
   'sec-fetch-dest', 'sec-fetch-mode', 'sec-fetch-site', 'sec-fetch-user', 'dnt', 'upgrade-insecure-requests'];
 
-async function fetchTarget(targetUrl, method, reqHeaders, bodyBuf) {
+async function fetchTarget(targetUrl, method, reqHeaders, bodyBuf, sid) {
   let url = targetUrl;
   let m = method;
   let buf = bodyBuf;
@@ -431,6 +509,12 @@ async function fetchTarget(targetUrl, method, reqHeaders, bodyBuf) {
 
   for (let hop = 0; hop < 6; hop++) {
     const uu = new URL(url);
+    /* محافظت SSRF روی «هر» پرش — ایراد قبلی: فقط مقصد اول بررسی می‌شد و
+       ریدایرکت به 169.254.169.254 یا 127.0.0.1 از دست رد می‌شد. */
+    if (!ALLOW_PRIVATE) {
+      if (isBlockedHost(uu.hostname)) throw Object.assign(new Error('SSRF'), { code: 'SSRF' });
+      if (!(await egressAllowed(uu.hostname))) throw Object.assign(new Error('SSRF'), { code: 'SSRF' });
+    }
     const headers = {
       'user-agent': reqHeaders['user-agent'] || UA,
       'accept': reqHeaders['accept'] || '*/*',
@@ -444,7 +528,7 @@ async function fetchTarget(targetUrl, method, reqHeaders, bodyBuf) {
     if (reqHeaders.range) headers.range = reqHeaders.range;
     if (reqHeaders['if-none-match']) headers['if-none-match'] = reqHeaders['if-none-match'];
     if (reqHeaders['if-modified-since']) headers['if-modified-since'] = reqHeaders['if-modified-since'];
-    const jc = jarCookie(uu.origin);
+    const jc = jar.cookie(sid, uu.origin);
     if (jc) headers.cookie = jc;
     if (buf && m !== 'GET' && m !== 'HEAD') {
       headers['content-type'] = reqHeaders['content-type'] || 'application/octet-stream';
@@ -458,10 +542,12 @@ async function fetchTarget(targetUrl, method, reqHeaders, bodyBuf) {
       dispatcher: activeDispatcher(),
     }, TIMEOUT_MS);
 
-    jarAdd(uu.origin, resp.headers.getSetCookie ? resp.headers.getSetCookie() : (resp.headers.get('set-cookie') ? [resp.headers.get('set-cookie')] : []));
+    jar.add(sid, uu.origin, resp.headers.getSetCookie ? resp.headers.getSetCookie() : (resp.headers.get('set-cookie') ? [resp.headers.get('set-cookie')] : []));
 
     const loc = resp.headers.get('location');
     if (resp.status >= 300 && resp.status < 400 && loc) {
+      // بدنه‌ی پاسخ‌های ریدایرکت مصرف/لغو می‌شود تا سوکت آزاد شود (نشت منابع قبلی)
+      try { if (resp.body) await resp.body.cancel(); } catch (_) { /* بسته */ }
       url = new URL(loc, url).href;
       if (resp.status === 303 || ((resp.status === 301 || resp.status === 302) && m === 'POST')) {
         m = 'GET';
@@ -547,7 +633,7 @@ async function hlsRequest(req, res, u) {
 
 /* --------------------------- پروکسی اصلی --------------------------- */
 
-async function proxyRequest(targetUrl, req, res, bodyBuf) {
+async function proxyRequest(targetUrl, req, res, bodyBuf, sid) {
   const method = ['GET', 'HEAD', 'POST', 'PUT', 'PATCH', 'DELETE'].includes(req.method) ? req.method : 'GET';
 
   // کش ایستاها
@@ -562,8 +648,11 @@ async function proxyRequest(targetUrl, req, res, bodyBuf) {
 
   let out;
   try {
-    out = await fetchTarget(targetUrl, method, req.headers, bodyBuf);
+    out = await fetchTarget(targetUrl, method, req.headers, bodyBuf, sid);
   } catch (e) {
+    if (e && e.code === 'SSRF') {
+      return sendHtml(res, 403, errorPage(403, 'دسترسی به آدرس‌های داخلی/لوکال از طریق پروکسی مجاز نیست.', targetUrl));
+    }
     noteRouteFailure();
     const timedOut = e && (e.name === 'TimeoutError' || e.name === 'AbortError');
     const viaProxy = ipState.mode !== 'direct';
@@ -586,17 +675,25 @@ async function proxyRequest(targetUrl, req, res, bodyBuf) {
   }
   headers['x-robots-tag'] = 'noindex';
 
+  // کوکی نشست مرورگر — در اولین پاسخ سِت می‌شود تا جارِ کوکیِ سایت مقصد
+  // فقط برای همین کاربر نگه داشته شود (ایراد اشتراک نشست بین کاربران)
+  const setCookies = [];
+  if (!sid) { sid = newSid(); }
+  setCookies.push(SID_COOKIE + '=' + sid + '; Path=/; HttpOnly; SameSite=Lax; Max-Age=31536000');
+
   if (isHtml) {
     const dest = req.headers['sec-fetch-dest'];
     if (!dest || dest === 'document') {
       try {
-        headers['set-cookie'] = ORIGIN_COOKIE + '=' + encodeURIComponent(new URL(finalUrl).origin) +
-          '; Path=/; HttpOnly; SameSite=Lax; Max-Age=86400';
+        setCookies.push(ORIGIN_COOKIE + '=' + encodeURIComponent(new URL(finalUrl).origin) +
+          '; Path=/; HttpOnly; SameSite=Lax; Max-Age=86400');
       } catch (_) { /* نادیده گرفته می‌شود */ }
     }
   }
+  headers['set-cookie'] = setCookies;
 
   if (resp.status === 204 || resp.status === 304 || method === 'HEAD') {
+    try { if (resp.body) await resp.body.cancel(); } catch (_) { /* بسته */ }
     res.writeHead(resp.status, headers);
     return res.end();
   }
@@ -604,28 +701,38 @@ async function proxyRequest(targetUrl, req, res, bodyBuf) {
   if (isHtml || isCss) {
     headers['content-type'] = isHtml ? 'text/html; charset=utf-8' : 'text/css; charset=utf-8';
     if (isHtml) headers['cache-control'] = 'no-store'; // صفحه داینامیک؛ کش نشود
+    /* رفع باگ قطع صفحه: قبلاً با for-await و break استریمِ نیمه‌خوانده لغو می‌شد
+       و ادامه‌ی صفحه گم می‌شد. الان با reader ادامه می‌دهیم و مستقیم می‌ریزیم. */
+    res.writeHead(resp.status, headers);
+    if (!resp.body) return res.end();
+    const reader = resp.body.getReader();
     const chunks = [];
     let size = 0;
     let tooBig = false;
-    for await (const chunk of resp.body) {
-      size += chunk.length;
-      if (size > MAX_REWRITE) { tooBig = true; break; }
-      chunks.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk));
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      const c = Buffer.from(value);
+      size += c.length;
+      if (!tooBig && size > MAX_REWRITE) tooBig = true;
+      if (tooBig) {
+        if (!res.write(c)) await new Promise((r) => res.once('drain', r));
+        continue;
+      }
+      chunks.push(c);
     }
-    if (!tooBig) {
-      const buf = Buffer.concat(chunks);
-      const cs = /charset\s*=\s*["']?([\w-]+)/i.exec(ctype);
-      let dec;
-      try { dec = new TextDecoder(cs ? cs[1] : 'utf-8'); } catch (_) { dec = new TextDecoder('utf-8'); }
-      let text = dec.decode(buf);
-      text = isHtml ? rewriteHtml(text, finalUrl) : rewriteCss(text, finalUrl);
-      res.writeHead(resp.status, headers);
-      return res.end(text);
+    if (tooBig) return res.end();
+    const buf = Buffer.concat(chunks);
+    let cs = /charset\s*=\s*["']?([\w-]+)/i.exec(ctype);
+    if (!cs) { // هدر charset ندارد → از <meta charset> خود صفحه بخوان
+      const m2 = /<meta[^>]+charset\s*=\s*["']?([\w-]+)/i.exec(buf.slice(0, 4096).toString('latin1'));
+      if (m2) cs = m2;
     }
-    res.writeHead(resp.status, headers);
-    for (const c of chunks) res.write(c);
-    Readable.fromWeb(resp.body).pipe(res);
-    return;
+    let dec;
+    try { dec = new TextDecoder(cs ? cs[1] : 'utf-8'); } catch (_) { dec = new TextDecoder('utf-8'); }
+    let text = dec.decode(buf);
+    text = isHtml ? rewriteHtml(text, finalUrl) : rewriteCss(text, finalUrl);
+    return res.end(text);
   }
 
   // ایستا (عکس/فونت/اسکریپت/ویدیو): پاسخ فوری + کش موازی
@@ -669,6 +776,10 @@ function authOk(req) {
 }
 
 function handleLogin(req, res) {
+  const ip = clientIp(req);
+  if (loginLimited(ip)) {
+    return sendHtml(res, 429, loginPage(false, 'تلاش‌های ناموفق زیاد بود؛ ۱۰ دقیقه صبر کن.'));
+  }
   let data = '';
   req.on('data', (c) => {
     data += c;
@@ -677,13 +788,15 @@ function handleLogin(req, res) {
   req.on('end', () => {
     let pass = '';
     try { pass = String(new URLSearchParams(data).get('password') || ''); } catch (_) { /* خالی */ }
-    if (pass === PASSWORD) {
+    if (safeEqual(pass, PASSWORD)) {
+      loginFails.delete(ip);
       res.writeHead(302, {
         'location': '/',
         'set-cookie': AUTH_COOKIE + '=' + authValue() + '; Path=/; HttpOnly; SameSite=Lax; Max-Age=2592000',
       });
       res.end();
     } else {
+      noteLoginFail(ip);
       sendHtml(res, 401, loginPage(true));
     }
   });
@@ -703,7 +816,11 @@ async function handle(req, res) {
 
   const host = req.headers.host || 'localhost';
   const u = new URL(req.url, 'http://' + host);
-  const p = decodeURI(u.pathname);
+  // decodeURI روی مسیرهای خراب (مثل /%) Exception می‌اندازد — قبلاً ۵۰۰ می‌داد
+  let p;
+  try { p = decodeURI(u.pathname); } catch (_) { p = u.pathname; }
+  const sid = sidOf(req);
+  const cip = clientIp(req);
 
   // قفل رمز
   if (PASSWORD) {
@@ -715,7 +832,17 @@ async function handle(req, res) {
   }
 
   /* ---------- مسیرهای داخلی ---------- */
-  if (p === '/' || p === '/index.html') return sendHtml(res, 200, shellPage(!!PASSWORD));
+  if (p === '/' || p === '/index.html') {
+    // نشست مرورگر از همان صفحه‌ی اول سِت می‌شود تا همه‌ی درخواست‌های بعدی px_sid داشته باشند
+    const sc = [SID_COOKIE + '=' + (sid || newSid()) + '; Path=/; HttpOnly; SameSite=Lax; Max-Age=31536000'];
+    res.writeHead(200, {
+      'content-type': 'text/html; charset=utf-8',
+      'cache-control': 'no-store',
+      'x-robots-tag': 'noindex',
+      'set-cookie': sc,
+    });
+    return res.end(shellPage(!!PASSWORD));
+  }
   if (p === '/newtab') return sendHtml(res, 200, newtabPage());
   if (p === '/health') { res.writeHead(200, { 'content-type': 'text/plain; charset=utf-8', 'access-control-allow-origin': '*' }); return res.end('ok'); }
   if (u.pathname === '/login') { res.writeHead(302, { location: '/' }); return res.end(); }
@@ -732,21 +859,29 @@ async function handle(req, res) {
     return res.end(HLS_JS);
   }
 
-  /* ---------- تغییر IP خروجی ---------- */
-  const IP_CORS = {
+  /* ---------- تغییر IP خروجی ----------
+   * قفل امنیتی: درخواست‌های تغییردهنده (POST) فقط از مبدأ خود سرور پذیرفته
+   * می‌شوند. قبلاً CORS باز (*) بود و هر سایتی می‌توانست حالت خروجی را عوض کند.
+   * پنل پوسته هم اگر سرور فعال جای دیگری باشد، از مسیر /proxy خودش می‌رود. */
+  function sameOriginOk() {
+    const orig = req.headers.origin;
+    if (!orig) return true; // درخواست غیرمرورگری (اپ/curl) — Origin ندارد
+    try { return new URL(orig).host === host; } catch (_) { return false; }
+  }
+  const IP_JSON = {
     'content-type': 'application/json; charset=utf-8',
     'cache-control': 'no-store',
-    'access-control-allow-origin': '*',
-    'access-control-allow-methods': 'GET, POST, OPTIONS',
-    'access-control-allow-headers': 'content-type',
-    'access-control-max-age': '86400',
   };
   if ((p === '/_ip' || p === '/_ip/rotate' || p === '/_ip/mode' || p === '/_ip/test') && req.method === 'OPTIONS') {
-    res.writeHead(204, IP_CORS);
+    res.writeHead(204, IP_JSON);
     return res.end();
   }
+  if (rateLimited(cip, 'ip', IP_RATE_LIMIT)) {
+    res.writeHead(429, IP_JSON);
+    return res.end(JSON.stringify({ ok: false, error: 'درخواست‌های زیاد؛ کمی صبر کن.' }));
+  }
   if (p === '/_ip') {
-    res.writeHead(200, IP_CORS);
+    res.writeHead(200, IP_JSON);
     return res.end(JSON.stringify(ipStatusJson()));
   }
   // تست زنده‌ی مسیر فعلی — از طریق همان مسیری که درخواست‌های پروکسی می‌روند
@@ -759,20 +894,22 @@ async function handle(req, res) {
     } catch (e) {
       out.ok = false; out.error = 'تست مسیر ممکن نشد؛ مسیر ممکن است قطع باشد.';
     }
-    res.writeHead(200, IP_CORS);
+    res.writeHead(200, IP_JSON);
     return res.end(JSON.stringify(out));
   }
   if (p === '/_ip/rotate' && req.method === 'POST') {
+    if (!sameOriginOk()) { res.writeHead(403, IP_JSON); return res.end(JSON.stringify({ ok: false, error: 'درخواست از مبدأ ناشناس پذیرفته نمی‌شود.' })); }
     try {
       await rotateIp();
-      res.writeHead(200, IP_CORS);
+      res.writeHead(200, IP_JSON);
       return res.end(JSON.stringify({ ok: true, ...ipStatusJson() }));
     } catch (e) {
-      res.writeHead(503, IP_CORS);
+      res.writeHead(503, IP_JSON);
       return res.end(JSON.stringify({ ok: false, error: String(e && e.message || e), ...ipStatusJson() }));
     }
   }
   if (p === '/_ip/mode' && req.method === 'POST') {
+    if (!sameOriginOk()) { res.writeHead(403, IP_JSON); return res.end(JSON.stringify({ ok: false, error: 'درخواست از مبدأ ناشناس پذیرفته نمی‌شود.' })); }
     const body = await readBody(req, 64 * 1024).catch(() => Buffer.alloc(0));
     let mode = '';
     let proxyUrl = '';
@@ -786,13 +923,14 @@ async function handle(req, res) {
       proxyUrl = String(new URLSearchParams(raw).get('proxyUrl') || '').trim();
     }
     if (!['direct', 'pool', 'manual'].includes(mode)) {
-      res.writeHead(400, IP_CORS);
+      res.writeHead(400, IP_JSON);
       return res.end(JSON.stringify({ ok: false, error: 'mode باید direct یا pool یا manual باشد.' }));
     }
     if (mode === 'manual') {
-      if (!/^https?:\/\/[\w.-]+:\d+$/.test(proxyUrl)) {
-        res.writeHead(400, IP_CORS);
-        return res.end(JSON.stringify({ ok: false, error: 'آدرس پروکسی باید به شکل http://host:port باشد.' }));
+      // پروکسی شخصی حالا می‌تواند احراز هویت هم داشته باشد: http://user:pass@host:port
+      if (!/^https?:\/\/(?:[\w.+-]+(?::[\w.+-]*)?@)?[\w.-]+:\d{2,5}$/.test(proxyUrl)) {
+        res.writeHead(400, IP_JSON);
+        return res.end(JSON.stringify({ ok: false, error: 'آدرس پروکسی باید به شکل http://host:port یا http://user:pass@host:port باشد.' }));
       }
       ipState.manualUrl = proxyUrl;
       ipState.active = null;
@@ -805,19 +943,21 @@ async function handle(req, res) {
       ipState.manualUrl = '';
     }
     ipState.mode = mode;
-    res.writeHead(200, IP_CORS);
+    res.writeHead(200, IP_JSON);
     return res.end(JSON.stringify({ ok: true, ...ipStatusJson() }));
   }
 
   /* ---------- مسیرهای یوتیوب ---------- */
+  // یوتیوب هم از موتور undici و «حالت تغییر IP» عبور می‌کند (قبلاً fetch خام بود)
+  const yf = (url, opts) => doFetchStream(url, { ...(opts || {}), dispatcher: activeDispatcher() }, TIMEOUT_MS);
   if (p === '/yt/' || p === '/yt') return sendHtml(res, 200, ytHomePage());
   if (p === '/yt/watch') {
     const v = (u.searchParams.get('v') || '').trim();
     if (!/^[\w-]{6,15}$/.test(v)) return sendHtml(res, 400, errorPage(400, 'شناسه‌ی ویدیو معتبر نیست.', v));
     try {
-      /* کوکی نشست یوتیوب از جار (اگر کاربر از طریق پروکسی لاگین کرده باشد) */
-      const ytCookie = jarCookie('https://www.youtube.com') || '';
-      const info = await ytPlayerInfo(v, { cookie: ytCookie, ua: req.headers['user-agent'] });
+      /* کوکی نشست یوتیوب از جارِ همین کاربر (اگر از طریق پروکسی لاگین کرده باشد) */
+      const ytCookie = jar.cookie(sid, 'https://www.youtube.com') || '';
+      const info = await ytPlayerInfo(v, { cookie: ytCookie, ua: req.headers['user-agent'], fetch: yf });
       return sendHtml(res, 200, ytPlayerPage(info));
     } catch (e) {
       return sendHtml(res, 502, errorPage(502, 'دریافت اطلاعات ویدیو از یوتیوب ممکن نشد.', 'https://www.youtube.com/watch?v=' + v, e && e.message));
@@ -827,7 +967,7 @@ async function handle(req, res) {
     const q = (u.searchParams.get('q') || '').trim();
     if (!q) { res.writeHead(302, { location: '/yt/' }); return res.end(); }
     try {
-      const videos = await ytSearch(q);
+      const videos = await ytSearch(q, { fetch: yf });
       return sendHtml(res, 200, ytSearchPage(videos, q));
     } catch (e) {
       return sendHtml(res, 502, errorPage(502, 'جستجو در یوتیوب ممکن نشد.', q, e && e.message));
@@ -837,7 +977,7 @@ async function handle(req, res) {
     const listId = (u.searchParams.get('list') || '').trim();
     if (!/^[\w-]{10,64}$/.test(listId)) return sendHtml(res, 400, errorPage(400, 'شناسه‌ی پلی‌لیست معتبر نیست.', listId));
     try {
-      const videos = await ytPlaylist(listId);
+      const videos = await ytPlaylist(listId, { fetch: yf });
       return sendHtml(res, 200, ytPlaylistPage(videos, listId));
     } catch (e) {
       return sendHtml(res, 502, errorPage(502, 'دریافت پلی‌لیست ممکن نشد.', listId, e && e.message));
@@ -846,7 +986,7 @@ async function handle(req, res) {
   if (p === '/yt/embed') {
     const v = (u.searchParams.get('v') || '').trim();
     if (!/^[\w-]{6,15}$/.test(v)) return sendHtml(res, 400, errorPage(400, 'شناسه‌ی ویدیو معتبر نیست.', v));
-    return proxyRequest('https://www.youtube.com/embed/' + v + '?rel=0&hl=fa&color=white', req, res, undefined);
+    return proxyRequest('https://www.youtube.com/embed/' + v + '?rel=0&hl=fa&color=white', req, res, undefined, sid);
   }
   if (p === '/yt/api/hls') {
     const target = u.searchParams.get('u') || '';
@@ -883,6 +1023,11 @@ async function handle(req, res) {
 
   if (!target) return sendHtml(res, 404, notFoundPage());
 
+  // محدودیت نرخ برای پروکسی (ضد سوءاستفاده در حالت بدون رمز)
+  if (rateLimited(cip, 'px', RATE_LIMIT)) {
+    return sendHtml(res, 429, errorPage(429, 'درخواست‌های زیادی می‌فرستی؛ یک دقیقه صبر کن.', target));
+  }
+
   target = normalizeTarget(target);
 
   let turl;
@@ -906,7 +1051,7 @@ async function handle(req, res) {
   const bodyBuf = (req.method === 'POST' || req.method === 'PUT' || req.method === 'PATCH')
     ? await readBody(req) : undefined;
 
-  return proxyRequest(turl.href, req, res, bodyBuf);
+  return proxyRequest(turl.href, req, res, bodyBuf, sid);
 }
 
 /* --------------------------- اجرای سرور --------------------------- */
