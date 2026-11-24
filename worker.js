@@ -26,6 +26,7 @@ import {
   shellPage, newtabPage,
 } from './lib.mjs';
 import { handleRemote } from './remote.mjs';
+import { handleConfigs } from './configs.mjs';
 import { HLS_JS } from './assets.js';
 
 /* --------------------------- کش Cloudflare --------------------------- */
@@ -156,6 +157,11 @@ export default {
         return html(429, errorPage(429, 'درخواست‌های زیادی می‌فرستی؛ یک دقیقه صبر کن.', ''));
       }
 
+      // سلامت‌سنجی باید همیشه عمومی باشد — حتی وقتی رمز فعال است
+      // (اپ اندروید برای انتخاب لایه‌ی سالم به همین نقطه تکیه می‌کند؛
+      // اگر پشت قفل رمز بود، با فعال‌شدن رمز همه‌ی لایه‌ها «مرده» دیده می‌شدند)
+      if (path === '/health') return new Response('ok', { status: 200, headers: { 'access-control-allow-origin': '*' } });
+
       // قفل رمز
       if (PASSWORD) {
         const cookies = parseCookies(request.headers.get('cookie') || '');
@@ -188,7 +194,11 @@ export default {
         const r = await handleRemote(url);
         if (r) return r;
       }
-      if (path === '/health') return new Response('ok', { status: 200, headers: { 'access-control-allow-origin': '*' } });
+      /* ---------- کانفیگ‌های آماده (گیت‌هاب) ---------- */
+      if (path === '/configs' || path === '/api/configs') {
+        const r = await handleConfigs(url, cip);
+        if (r) return r;
+      }
       /* لایه‌ی Cloudflare نمی‌تواند از پروکسی خروجی استفاده کند؛ پنل «تغییر IP»
          این را می‌بیند و کاربر را به لایه‌ی Node (Railway/Render) راهنمایی می‌کند.
          قفل Origin: CORS باز حذف شد — سایت‌های دیگر به این API دسترسی ندارند. */

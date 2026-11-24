@@ -34,6 +34,7 @@ import {
   shellPage, newtabPage,
 } from './lib.mjs';
 import { handleRemote } from './remote.mjs';
+import { handleConfigs } from './configs.mjs';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
@@ -855,6 +856,10 @@ async function handle(req, res) {
   const sid = sidOf(req);
   const cip = clientIp(req);
 
+  // سلامت‌سنجی باید همیشه عمومی باشد — حتی وقتی رمز فعال است
+  // (اپ اندروید برای انتخاب لایه‌ی سالم به همین نقطه تکیه می‌کند)
+  if (p === '/health') { res.writeHead(200, { 'content-type': 'text/plain; charset=utf-8', 'access-control-allow-origin': '*' }); return res.end('ok'); }
+
   // قفل رمز
   if (PASSWORD) {
     if (!authOk(req)) {
@@ -882,7 +887,11 @@ async function handle(req, res) {
     const rr = await handleRemote(u);
     if (rr) return sendWebResponse(res, rr);
   }
-  if (p === '/health') { res.writeHead(200, { 'content-type': 'text/plain; charset=utf-8', 'access-control-allow-origin': '*' }); return res.end('ok'); }
+  /* ---------- کانفیگ‌های آماده (گیت‌هاب) ---------- */
+  if (p === '/configs' || p === '/api/configs') {
+    const rr = await handleConfigs(u, cip);
+    if (rr) return sendWebResponse(res, rr);
+  }
   if (u.pathname === '/login') { res.writeHead(302, { location: '/' }); return res.end(); }
   if (p === '/logout') {
     res.writeHead(302, { location: '/', 'set-cookie': AUTH_COOKIE + '=; Path=/; HttpOnly; Max-Age=0' });

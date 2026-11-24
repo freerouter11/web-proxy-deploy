@@ -1371,6 +1371,7 @@ function renderMenu(){
    '<div class="mi" data-a="newtab">تب جدید<span class="sc">Ctrl+T</span></div>'
   +'<div class="mi" data-a="inc">تب ناشناس</div>'
   +'<div class="mi" data-a="remote">مرورگر تصویری (ریموت)</div>'
+  +'<div class="mi" data-a="configs">کانفیگ‌های آماده (گیت‌هاب)</div>'
   +'<div class="msep"></div>'
   +'<div class="mi" data-a="history">تاریخچه</div>'
   +'<div class="mi" data-a="bookmarks">نشانک‌ها</div>'
@@ -1390,6 +1391,7 @@ menuEl.addEventListener('click',function(e){
   if(a==='newtab')newTab(true);
   else if(a==='inc')newTab(true,true);
   else if(a==='remote'){newTab(true).frame.src='/remote';}
+  else if(a==='configs'){newTab(true).frame.src='/configs';}
   else if(a==='history')showHistory();
   else if(a==='bookmarks')showBookmarks();
   else if(a==='find')openFind();
@@ -1446,7 +1448,8 @@ function showBookmarks(){
 }
 function showAbout(){
   openPanel({t:'درباره',b:
-   '<p class="tiny">مرورگر پروکسی شخصی — نسخه ۳.۰</p>'
+   '<p class="tiny">مرورگر پروکسی شخصی — نسخه ۴٫۳</p>'
+   +'<p class="tiny">جدید در ۴٫۳: بخش «کانفیگ‌های آماده (گیت‌هاب)» — کانفیگ‌های رایگان V2Ray از مخازن عمومی، با لینک اشتراک آماده برای v2rayNG/Hiddify. مرورگر تصویری (ریموت): سایت‌ها را به‌صورت عکس با لینک‌های شماره‌دار ببین.</p>'
   +'<p class="tiny">تمام صفحات از طریق سرور واسط باز می‌شوند؛ لینک‌ها، تصاویر، فرم‌ها و درخواست‌های داینامیک هم از مسیر پروکسی رد می‌شوند. پشتیبانی پخش یوتیوب با کیفیت انتخابی، موتور سرعت با اتصال‌های زنده و — روی لایه‌های Node — تغییر IP خروجی.</p>'
   +'<p class="tiny">میان‌برها: <b>Ctrl+T</b> تب جدید · <b>Ctrl+W</b> بستن تب · <b>Ctrl+L</b> نوار آدرس · <b>Ctrl+D</b> نشانک · <b>Ctrl+F</b> جستجو در صفحه · <b>Alt+→/←</b> عقب/جلو · <b>Ctrl +/-/0</b> بزرگ‌نمایی</p>'});
 }
@@ -1870,6 +1873,7 @@ var ENGINES={
 };
 var TILES=[
   {t:'مرورگر تصویری',u:'/remote',c:'#7c3aed',i:'▣'},
+  {t:'کانفیگ‌ها',u:'/configs',c:'#059669',i:'⚙'},
   {t:'یوتیوب',u:'https://www.youtube.com/',c:'#f43f5e',i:'▶'},
   {t:'BBC فارسی',u:'https://www.bbc.com/persian',c:'#b91c1c',i:'B'},
   {t:'ویکی‌پدیا',u:'https://fa.wikipedia.org/',c:'#334155',i:'W'},

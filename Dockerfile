@@ -11,7 +11,7 @@ COPY --chown=node:node package.json package-lock.json railway.json ./
 RUN npm ci --omit=dev && chown -R node:node node_modules
 
 # فقط فایل‌های لازم (کد سبک)
-COPY --chown=node:node server.js lib.mjs remote.mjs assets.js hls.min.js ./
+COPY --chown=node:node server.js lib.mjs remote.mjs configs.mjs assets.js hls.min.js ./
 
 ENV NODE_ENV=production
 # سقف هیپ مناسب پلن‌های رایگان کم‌رم (Back4App رایگان = ۲۵۶MB) — از OOM جلوگیری می‌کند
