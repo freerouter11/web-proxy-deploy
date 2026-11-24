@@ -25,6 +25,7 @@ import {
   ytHomePage, ytSearchPage, ytPlaylistPage, ytPlayerPage,
   shellPage, newtabPage,
 } from './lib.mjs';
+import { handleRemote } from './remote.mjs';
 import { HLS_JS } from './assets.js';
 
 /* --------------------------- کش Cloudflare --------------------------- */
@@ -182,6 +183,11 @@ export default {
         });
       }
       if (path === '/newtab') return html(200, newtabPage());
+      /* ---------- مرورگر تصویری (ریموت) ---------- */
+      if (path === '/remote' || path === '/api/nav' || path === '/shot') {
+        const r = await handleRemote(url);
+        if (r) return r;
+      }
       if (path === '/health') return new Response('ok', { status: 200, headers: { 'access-control-allow-origin': '*' } });
       /* لایه‌ی Cloudflare نمی‌تواند از پروکسی خروجی استفاده کند؛ پنل «تغییر IP»
          این را می‌بیند و کاربر را به لایه‌ی Node (Railway/Render) راهنمایی می‌کند.

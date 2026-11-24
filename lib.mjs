@@ -1370,6 +1370,7 @@ function renderMenu(){
   menuEl.innerHTML=
    '<div class="mi" data-a="newtab">تب جدید<span class="sc">Ctrl+T</span></div>'
   +'<div class="mi" data-a="inc">تب ناشناس</div>'
+  +'<div class="mi" data-a="remote">مرورگر تصویری (ریموت)</div>'
   +'<div class="msep"></div>'
   +'<div class="mi" data-a="history">تاریخچه</div>'
   +'<div class="mi" data-a="bookmarks">نشانک‌ها</div>'
@@ -1388,6 +1389,7 @@ menuEl.addEventListener('click',function(e){
   var a=mi.getAttribute('data-a');
   if(a==='newtab')newTab(true);
   else if(a==='inc')newTab(true,true);
+  else if(a==='remote'){newTab(true).frame.src='/remote';}
   else if(a==='history')showHistory();
   else if(a==='bookmarks')showBookmarks();
   else if(a==='find')openFind();
@@ -1867,6 +1869,7 @@ var ENGINES={
   yt:function(q){return 'https://www.youtube.com/results?search_query='+encodeURIComponent(q);}
 };
 var TILES=[
+  {t:'مرورگر تصویری',u:'/remote',c:'#7c3aed',i:'▣'},
   {t:'یوتیوب',u:'https://www.youtube.com/',c:'#f43f5e',i:'▶'},
   {t:'BBC فارسی',u:'https://www.bbc.com/persian',c:'#b91c1c',i:'B'},
   {t:'ویکی‌پدیا',u:'https://fa.wikipedia.org/',c:'#334155',i:'W'},
@@ -1887,6 +1890,7 @@ for(var i=0;i<TILES.length;i++){
   })(TILES[i]);
 }
 function go(url){
+  if(url.charAt(0)==='/'){location.href=url;return;} // مسیر داخلی مثل مرورگر تصویری
   if(window.parent&&window.parent!==window){
     try{window.parent.postMessage({px:'go',url:url},'*');return;}catch(e){}
   }

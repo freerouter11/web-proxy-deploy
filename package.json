@@ -1,6 +1,6 @@
 {
   "name": "web-proxy",
-  "version": "4.1.0",
+  "version": "4.2.0",
   "private": true,
   "description": "مرورگر پروکسی شخصی — تب‌ها، یوتیوب، سوییچ سرور، تغییر IP خروجی — نسخه ۳٫۱ پس از بازبینی انتقادی",
   "type": "module",

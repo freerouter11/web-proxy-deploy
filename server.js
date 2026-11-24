@@ -33,6 +33,7 @@ import {
   ytHomePage, ytSearchPage, ytPlaylistPage, ytPlayerPage,
   shellPage, newtabPage,
 } from './lib.mjs';
+import { handleRemote } from './remote.mjs';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
@@ -183,6 +184,15 @@ function sendHtml(res, status, body) {
     'x-robots-tag': 'noindex',
   });
   res.end(body);
+}
+
+/* تبدیل Response استاندارد (خروجی ماژول remote.mjs) به پاسخ سرور Node */
+async function sendWebResponse(res, r) {
+  const headers = {};
+  r.headers.forEach((v, k) => { headers[k] = v; });
+  const buf = Buffer.from(await r.arrayBuffer());
+  res.writeHead(r.status, headers);
+  res.end(buf);
 }
 
 function readBody(req, limit) {
@@ -867,6 +877,11 @@ async function handle(req, res) {
     return res.end(shellPage(!!PASSWORD));
   }
   if (p === '/newtab') return sendHtml(res, 200, newtabPage());
+  /* ---------- مرورگر تصویری (ریموت) ---------- */
+  if (p === '/remote' || p === '/api/nav' || p === '/shot') {
+    const rr = await handleRemote(u);
+    if (rr) return sendWebResponse(res, rr);
+  }
   if (p === '/health') { res.writeHead(200, { 'content-type': 'text/plain; charset=utf-8', 'access-control-allow-origin': '*' }); return res.end('ok'); }
   if (u.pathname === '/login') { res.writeHead(302, { location: '/' }); return res.end(); }
   if (p === '/logout') {
