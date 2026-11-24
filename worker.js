@@ -25,8 +25,8 @@ import {
   ytHomePage, ytSearchPage, ytPlaylistPage, ytPlayerPage,
   shellPage, newtabPage,
 } from './lib.mjs';
-import { handleRemote } from './remote.mjs';
 import { HLS_JS } from './assets.js';
+import * as remote from './remote.mjs';
 
 /* --------------------------- کش Cloudflare --------------------------- */
 
@@ -183,11 +183,15 @@ export default {
         });
       }
       if (path === '/newtab') return html(200, newtabPage());
-      /* ---------- مرورگر تصویری (ریموت) ---------- */
-      if (path === '/remote' || path === '/api/nav' || path === '/shot') {
-        const r = await handleRemote(url);
-        if (r) return r;
+
+      /* ---------- مرورگر تصویری (ریموت) ----------
+         سرور صفحه را باز می‌کند، عکس می‌گیرد (سرویس‌های خارجی رایگان + کش)
+         و لینک‌ها را شماره‌گذاری می‌کند؛ کاربر با شماره در همان لینک جلو می‌رود. */
+      {
+        const remoteRes = await remote.handleRemote(path, url);
+        if (remoteRes) return remoteRes;
       }
+
       if (path === '/health') return new Response('ok', { status: 200, headers: { 'access-control-allow-origin': '*' } });
       /* لایه‌ی Cloudflare نمی‌تواند از پروکسی خروجی استفاده کند؛ پنل «تغییر IP»
          این را می‌بیند و کاربر را به لایه‌ی Node (Railway/Render) راهنمایی می‌کند.
@@ -447,33 +451,10 @@ async function proxyFetch(request, targetUrl, ctx, sid) {
   }
   if (!['GET', 'HEAD', 'POST', 'PUT', 'PATCH', 'DELETE'].includes(method)) method = 'GET';
 
-  /* کش کوتاه صفحه (۳۰ ثانیه): باز کردن دوباره‌ی همین صفحه بدون رفت‌وبرگشت به مبدأ و بدون بازنویسی مجدد.
-     فقط صفحات عمومی کش می‌شوند (بدون کوکی شخصی و بدون set-cookie مبدأ). */
-  if (method === 'GET' && CACHE) {
-    try {
-      const hit = await CACHE.match(new Request('https://pxcache.internal/page/' + targetUrl));
-      if (hit) {
-        const h = new Headers();
-        h.set('content-type', 'text/html; charset=utf-8');
-        h.set('cache-control', 'private, max-age=20, stale-while-revalidate=300');
-        h.set('x-robots-tag', 'noindex');
-        h.set('x-px-cache', 'HIT');
-        h.append('set-cookie', SID_COOKIE + '=' + (sid || newSid()) + '; Path=/; HttpOnly; Secure; SameSite=Lax; Max-Age=31536000');
-        const dest = request.headers.get('sec-fetch-dest');
-        const fin = hit.headers.get('x-px-final');
-        if ((!dest || dest === 'document') && fin) {
-          try { h.append('set-cookie', ORIGIN_COOKIE + '=' + encodeURIComponent(new URL(fin).origin) + '; Path=/; HttpOnly; SameSite=Lax; Max-Age=86400'); } catch (_) { }
-        }
-        return new Response(await hit.text(), { status: 200, headers: h });
-      }
-    } catch (_) { /* کش خراب است؛ نادیده گرفته می‌شود */ }
-  }
-
   /* ریدایرکت‌ها دستی دنبال می‌شوند تا «هر پرش» از نظر SSRR بررسی شود —
      قبلاً redirect:'follow' بود و مقصدِ ریدایرکت بدون بررسی می‌ماند. */
   let url = targetUrl;
   let resp = null;
-  let personalized = false; // اگر کوکی سایت مقصد فرستاده شد، صفحه شخصی است و کش نمی‌شود
   for (let hop = 0; hop < 6; hop++) {
     const uu = new URL(url);
     if (isBlockedHost(uu.hostname)) {
@@ -494,7 +475,7 @@ async function proxyFetch(request, targetUrl, ctx, sid) {
     if (request.headers.get('if-none-match')) headers['if-none-match'] = request.headers.get('if-none-match');
     // کوکی سایت مقصد از جار «همین نشست» (پشتیبانی ورود — best-effort روی ورکر)
     const jc = jar.cookie(sid, uu.origin);
-    if (jc) { headers.cookie = jc; personalized = true; }
+    if (jc) headers.cookie = jc;
     if (body && method !== 'GET' && method !== 'HEAD') {
       const ct = request.headers.get('content-type');
       if (ct) headers['content-type'] = ct;
@@ -572,7 +553,7 @@ async function proxyFetch(request, targetUrl, ctx, sid) {
 
   if (isHtml || isCss) {
     out.set('content-type', isHtml ? 'text/html; charset=utf-8' : 'text/css; charset=utf-8');
-    if (isHtml) out.set('cache-control', 'private, max-age=20, stale-while-revalidate=300'); // برگشت/جلو/بازخوانی فوری؛ تازگی ۲۰ ثانیه
+    if (isHtml) out.set('cache-control', 'no-store'); // صفحه داینامیک؛ کش نشود
     const buf = await resp.arrayBuffer();
     if (buf.byteLength > WORKER_REWRITE_MAX || buf.byteLength > MAX_REWRITE) {
       return new Response(buf, { status: resp.status, headers: out }); // بدون بازنویسی (سقف CPU ورکر)
@@ -582,18 +563,6 @@ async function proxyFetch(request, targetUrl, ctx, sid) {
     try { dec = new TextDecoder(cs ? cs[1] : 'utf-8'); } catch (_) { dec = new TextDecoder('utf-8'); }
     let text = dec.decode(buf);
     text = isHtml ? rewriteHtml(text, finalUrl) : rewriteCss(text, finalUrl);
-    // کش کوتاه صفحه (۳۰ث) — فقط صفحات عمومی؛ کلید روی نشانی درخواستی و نهایی (ریدایرکت‌ها)
-    if (isHtml && method === 'GET' && CACHE && resp.status === 200 && !personalized
-      && !resp.headers.get('set-cookie') && text.length <= 768 * 1024 && !/https?:\/\/[^/@]+@/.test(targetUrl)) {
-      const mk = () => new Response(text, {
-        headers: { 'content-type': 'text/html; charset=utf-8', 'x-px-final': finalUrl },
-      });
-      out.set('x-px-cache', 'MISS');
-      ctx.waitUntil(CACHE.put(new Request('https://pxcache.internal/page/' + targetUrl), mk()).catch(() => {}));
-      if (finalUrl !== targetUrl) {
-        ctx.waitUntil(CACHE.put(new Request('https://pxcache.internal/page/' + finalUrl), mk()).catch(() => {}));
-      }
-    }
     return new Response(text, { status: resp.status, headers: out });
   }
 

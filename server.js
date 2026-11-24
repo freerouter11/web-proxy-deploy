@@ -33,7 +33,7 @@ import {
   ytHomePage, ytSearchPage, ytPlaylistPage, ytPlayerPage,
   shellPage, newtabPage,
 } from './lib.mjs';
-import { handleRemote } from './remote.mjs';
+import * as remote from './remote.mjs';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
@@ -186,12 +186,16 @@ function sendHtml(res, status, body) {
   res.end(body);
 }
 
-/* تبدیل Response استاندارد (خروجی ماژول remote.mjs) به پاسخ سرور Node */
+// نوشتن یک Response از ماژول ریموت (یا هر fetch) روی پاسخ Node
 async function sendWebResponse(res, r) {
-  const headers = {};
-  r.headers.forEach((v, k) => { headers[k] = v; });
+  const h = {};
+  r.headers.forEach(function (v, k) {
+    k = String(k).toLowerCase();
+    if (k === 'content-encoding' || k === 'transfer-encoding' || k === 'content-length' || k === 'connection') return;
+    h[k] = v;
+  });
   const buf = Buffer.from(await r.arrayBuffer());
-  res.writeHead(r.status, headers);
+  res.writeHead(r.status, h);
   res.end(buf);
 }
 
@@ -733,7 +737,7 @@ async function proxyRequest(targetUrl, req, res, bodyBuf, sid) {
 
   if (isHtml || isCss) {
     headers['content-type'] = isHtml ? 'text/html; charset=utf-8' : 'text/css; charset=utf-8';
-    if (isHtml) headers['cache-control'] = 'private, max-age=20, stale-while-revalidate=300'; // برگشت/جلو/بازخوانی فوری؛ تازگی ۲۰ ثانیه
+    if (isHtml) headers['cache-control'] = 'no-store'; // صفحه داینامیک؛ کش نشود
     /* رفع باگ قطع صفحه: قبلاً با for-await و break استریمِ نیمه‌خوانده لغو می‌شد
        و ادامه‌ی صفحه گم می‌شد. الان با reader ادامه می‌دهیم و مستقیم می‌ریزیم. */
     res.writeHead(resp.status, headers);
@@ -877,11 +881,18 @@ async function handle(req, res) {
     return res.end(shellPage(!!PASSWORD));
   }
   if (p === '/newtab') return sendHtml(res, 200, newtabPage());
-  /* ---------- مرورگر تصویری (ریموت) ---------- */
+
+  /* ---------- مرورگر تصویری (ریموت) ----------
+     سرور صفحه را باز می‌کند، عکس می‌گیرد (سرویس‌های خارجی رایگان + کش)
+     و لینک‌ها را شماره‌گذاری می‌کند. */
   if (p === '/remote' || p === '/api/nav' || p === '/shot') {
-    const rr = await handleRemote(u);
-    if (rr) return sendWebResponse(res, rr);
+    if (rateLimited(cip, 'remote', 60)) {
+      return sendHtml(res, 429, errorPage(429, 'درخواست‌های زیاد؛ یک دقیقه صبر کن.', ''));
+    }
+    const r = await remote.handleRemote(p, u);
+    if (r) return sendWebResponse(res, r);
   }
+
   if (p === '/health') { res.writeHead(200, { 'content-type': 'text/plain; charset=utf-8', 'access-control-allow-origin': '*' }); return res.end('ok'); }
   if (u.pathname === '/login') { res.writeHead(302, { location: '/' }); return res.end(); }
   if (p === '/logout') {
