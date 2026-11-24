@@ -298,7 +298,10 @@ function faviconResponse() {
 
 /* ------------------------ بازنویسی آدرس‌ها ------------------------ */
 
-function proxiedPath(u, base) {
+/* آیا مسیری از مسیرهای داخلی خود پروکسی است؟ (در حالت SPA نباید به کوکی مبدأ برود) */
+const RESERVED_PATH_RE = /^(\/$|\/newtab$|\/remote$|\/configs$|\/yt(?:\/|$)|\/login$|\/logout$|\/health$|\/favicon\.ico$|\/assets\/|\/api\/|\/_ip|\/proxy$|\/shot$|\/__)/i;
+
+function proxiedPath(u, base, opts) {
   if (u === null || u === undefined) return null;
   u = String(u).trim();
   if (!u) return null;
@@ -308,6 +311,14 @@ function proxiedPath(u, base) {
   try {
     const abs = new URL(u, base);
     if (abs.protocol !== 'http:' && abs.protocol !== 'https:') return null;
+    /* hrefهای ناوبری با پرچم pxo می‌روند تا ورکر پاسخ را به «مسیر واقعی +
+       کوکی مبدأ» تبدیل کند (حالت SPA — مسیریابی کلاینت سایت‌ها کار کند)؛
+       فریم‌ها و فرم‌ها بدون پرچم می‌مانند. */
+    if (opts && opts.nav) {
+      let p = '/proxy?url=' + encodeURIComponent(abs.href);
+      if (!RESERVED_PATH_RE.test(abs.pathname)) p += '&pxo=1';
+      return p;
+    }
     return '/proxy?url=' + encodeURIComponent(abs.href);
   } catch (_) { return null; }
 }
@@ -422,8 +433,25 @@ document.addEventListener('click',function(e){
  };
 });
 try{
+ // نمایشیِ کامل serviceWorker — نسخه‌ی قبلی undefined برمی‌گرداند و اپ‌های
+ // Next.js (بی‌بی‌سی فارسی، DW فارسی) روی navigator.serviceWorker.register
+ // کرش می‌کردند و کل صفحه را با صفحه‌ی 404 خودشان جایگزین می‌کردند.
+ // حالا register() با یک رجیستریشن نمایشی resolve می‌شود؛ هیچ سرویس‌ورکری
+ // واقعاً نصب نمی‌شود اما هیچ اپی هم روی آن کرش نمی‌کند.
  if(navigator.serviceWorker){
-  Object.defineProperty(Navigator.prototype,'serviceWorker',{configurable:true,get:function(){return undefined;}});
+  var pxReg={scope:'/',active:null,installing:null,waiting:null,
+   navigationPreload:{enable:function(){return Promise.resolve();},disable:function(){return Promise.resolve();},setHeader:function(){return Promise.resolve();}},
+   pushManager:{subscribe:function(){return Promise.reject(new Error('unsupported'));},getSubscription:function(){return Promise.resolve(null);},permissionState:function(){return Promise.resolve('denied');}},
+   sync:{register:function(){return Promise.reject(new Error('unsupported'));},getTags:function(){return Promise.resolve([]);}},
+   update:function(){return Promise.resolve();},unregister:function(){return Promise.resolve(true);},
+   addEventListener:function(){},removeEventListener:function(){},dispatchEvent:function(){return false;}};
+  var pxSw={register:function(){return Promise.resolve(pxReg);},
+   getRegistration:function(){return Promise.resolve(undefined);},
+   getRegistrations:function(){return Promise.resolve([]);},
+   addEventListener:function(){},removeEventListener:function(){},
+   dispatchEvent:function(){return false;},
+   controller:null,ready:Promise.resolve(pxReg),onmessage:null,oncontrollerchange:null};
+  Object.defineProperty(Navigator.prototype,'serviceWorker',{configurable:true,get:function(){return pxSw;}});
  }
 }catch(e){}
 })();`;
@@ -433,7 +461,14 @@ function rewriteHtml(htmlText, base) {
   htmlText = htmlText.replace(/<meta[^>]+http-equiv\s*=\s*["']?content-security-policy["']?[^>]*>/gi, '');
   htmlText = htmlText.replace(/\sintegrity\s*=\s*("[^"]*"|'[^']*')/gi, '');
 
-  htmlText = htmlText.replace(/(\s(?:href|src|action|poster|formaction|data-src|data-href|data-url|data-original|data-lazy-src)\s*=\s*)("([^"]*)"|'([^']*)')/gi,
+  // hrefهای لینک (ناوبری واقعی) با پرچم pxo — مسیر SPA؛ بقیه‌ی ویژگی‌ها بدون آن
+  htmlText = htmlText.replace(/(\shref\s*=\s*)("([^"]*)"|'([^']*)')/gi,
+    (m, pre, _all, dq, sq) => {
+      const p = proxiedPath(dq !== undefined ? dq : sq, base, { nav: true });
+      return p ? pre + '"' + p + '"' : m;
+    });
+
+  htmlText = htmlText.replace(/(\s(?:src|action|poster|formaction|data-src|data-href|data-url|data-original|data-lazy-src)\s*=\s*)("([^"]*)"|'([^']*)')/gi,
     (m, pre, _all, dq, sq) => {
       const p = proxiedPath(dq !== undefined ? dq : sq, base);
       return p ? pre + '"' + p + '"' : m;
@@ -480,8 +515,10 @@ function rewriteHtml(htmlText, base) {
     return p ? pre + mm[1] + p + post : m;
   });
 
-  // تزریق پچ کلاینت در ابتدای head — تا fetch/XHR/لینک‌های داینامیک هم از پروکسی رد شوند
-  const inject = '<script>' + CLIENT_PATCH + '</script>';
+  // تزریق پچ کلاینت + متای نشانی واقعی در ابتدای head — متا برای شل
+  // (نوار آدرس/تاریخچه) و اپ اندروید؛ پچ برای fetch/XHR داینامیک
+  const inject = '<meta name="px-target" content="' + esc(base) + '">' +
+    '<script>' + CLIENT_PATCH + '</script>';
   if (/<head[^>]*>/i.test(htmlText)) {
     htmlText = htmlText.replace(/<head[^>]*>/i, (m) => m + inject);
   } else if (/<html[^>]*>/i.test(htmlText)) {
@@ -1041,16 +1078,16 @@ body{display:flex;flex-direction:column;background:#0b1220;color:#e7edf8;
 /* --- نوار ابزار --- */
 #toolbar{display:flex;align-items:center;gap:5px;padding:7px 10px;background:#0b1220;
   border-bottom:1px solid #1b2740;flex-wrap:nowrap}
-.nbtn{width:34px;height:34px;border-radius:9px;border:0;background:transparent;color:#a9bcd9;
+.nbtn{width:40px;height:40px;border-radius:10px;border:0;background:transparent;color:#a9bcd9;
   cursor:pointer;font-size:15px;flex:0 0 auto;display:inline-flex;align-items:center;justify-content:center}
 .nbtn:hover{background:#131f39;color:#e7edf8}
 .nbtn.dis{opacity:.3;cursor:default}
 .nbtn.dis:hover{background:transparent;color:#a9bcd9}
-#addr{flex:1;min-width:80px;padding:9px 16px;border-radius:18px;border:1px solid #24334f;
+#addr{flex:1;min-width:80px;padding:11px 16px;border-radius:20px;border:1px solid #24334f;
   background:#0d1730;color:#e7edf8;font-size:13.8px;outline:none;direction:ltr;text-align:left;
   font-family:inherit;transition:border-color .15s}
 #addr:focus{border-color:#38bdf8;box-shadow:0 0 0 3px rgba(56,189,248,.15)}
-#addr::placeholder{direction:rtl;text-align:right;color:#5d7295}
+#addr::placeholder{direction:rtl;text-align:right;color:#8195b8}
 #kb{position:absolute;top:60px;inset-inline-start:0;background:#22304d;border-radius:8px;padding:2px 10px;
   font-size:11.5px;color:#c7d5ee;display:none}
 /* --- نوار نشانک‌ها --- */
@@ -1081,7 +1118,7 @@ body{display:flex;flex-direction:column;background:#0b1220;color:#e7edf8;
 .lrow .lt b{display:block;font-size:13.2px;font-weight:600;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
 .lrow .lt span{display:block;color:#7f92b3;font-size:11.5px;direction:ltr;text-align:left;
   white-space:nowrap;overflow:hidden;text-overflow:ellipsis;margin-top:2px}
-.lrow .ld{color:#5d7295;font-size:11px;flex:0 0 auto}
+.lrow .ld{color:#8195b8;font-size:11px;flex:0 0 auto}
 .pbtn{padding:9px 18px;border-radius:10px;border:1px solid #2a3a5c;background:#131f39;color:#c7d5ee;
   cursor:pointer;font-family:inherit;font-size:13px}
 .pbtn:hover{border-color:#38bdf8;color:#7dd3fc}
@@ -1111,27 +1148,36 @@ textarea{width:100%;min-height:110px;padding:12px;border-radius:10px;border:1px 
 #findbar input{width:210px;padding:8px 12px;border-radius:20px;border:1px solid #24334f;background:#0d1730;
   color:#e7edf8;font-size:13.5px;outline:none;font-family:inherit;direction:inherit;text-align:inherit}
 #fcount{color:#7f92b3;font-size:12px;min-width:52px;text-align:center}
-#findbar .nbtn{width:30px;height:30px}
+#findbar .nbtn{width:36px;height:36px}
 /* --- منو --- */
 #menu{position:fixed;top:46px;inset-inline-end:10px;z-index:70;background:#0e1729;
   border:1px solid #22304d;border-radius:14px;padding:7px;display:none;min-width:215px;
   box-shadow:0 20px 60px rgba(0,0,0,.55)}
 #menu.on{display:block}
-.mi{display:flex;align-items:center;gap:10px;padding:10px 13px;border-radius:9px;color:#c7d5ee;
+.mi{display:flex;align-items:center;gap:10px;padding:12px 13px;border-radius:9px;color:#c7d5ee;
   cursor:pointer;font-size:13.5px;white-space:nowrap}
 .mi:hover{background:#16233f;color:#fff}
-.mi .sc{margin-inline-start:auto;color:#5d7295;font-size:11px;direction:ltr}
+.mi .sc{margin-inline-start:auto;color:#8195b8;font-size:11px;direction:ltr}
 .msep{height:1px;background:#1b2740;margin:5px 8px}
 mark.pxf{background:#f59e0b;color:#111;border-radius:3px}
 mark.pxf.on{background:#f43f5e;color:#fff}
 @media(max-width:620px){
   #bmbar{display:none}
   .tab{min-width:88px;max-width:140px}
-  #addr{font-size:12.5px;padding:8px 13px}
-  .nbtn{width:31px;height:31px}
+  #addr{font-size:13px;padding:10px 14px}
+  .nbtn{width:40px;height:40px}
+  .mi{padding:13px}
   #findbar{inset-inline-start:10px;inset-inline-end:10px;transform:none}
   #findbar input{width:auto;flex:1}
 }
+/* روی دستگاه لمسی میان‌برهای کیبورد بی‌معنی است — مخفی */
+@media(hover:none){.mi .sc{display:none}}
+/* نوار پیشرفت بارگیری — بازخورد هنگام ناوبری */
+#pbar{height:2px;background:transparent;position:relative;overflow:hidden}
+#pbar i{display:block;height:100%;width:0;background:linear-gradient(90deg,#0ea5e9,#22d3ee);
+  border-radius:2px;transition:width .3s ease}
+#pbar.on i{width:70%}
+#pbar.done i{width:100%;transition:width .15s ease}
 </style>
 </head>
 <body>
@@ -1145,9 +1191,10 @@ mark.pxf.on{background:#f43f5e;color:#fff}
   <button class="nbtn" id="breload" title="بارگیری مجدد (F5)">⟳</button>
   <button class="nbtn" id="bhome" title="خانه">⌂</button>
   <input id="addr" placeholder="جستجو یا آدرس سایت را وارد کنید…" autocomplete="off" spellcheck="false">
-  <button class="nbtn" id="bstar" title="نشانک (Ctrl+D)">☆</button>
+  <button class="nbtn" id="bstar" title="نشانک">☆</button>
   <button class="nbtn" id="bmenu" title="منو">⋮</button>
 </div>
+<div id="pbar"><i></i></div>
 <div id="bmbar"></div>
 <div id="content"><div id="emptystub">یک تب جدید باز کن</div></div>
 <div id="overlay"><div class="panel" id="panelbox"></div></div>
@@ -1173,9 +1220,10 @@ var settings=lsGet(LS.s,null)||{
 var bookmarks=lsGet(LS.b,[]);
 var history=lsGet(LS.h,[]);
 var ENGINES={
-  ddg:{t:'داک‌داک‌گو',u:function(q){return 'https://html.duckduckgo.com/html/?q='+encodeURIComponent(q);}},
+  ddg:{t:'داک‌داک‌گو',u:function(q){return 'https://lite.duckduckgo.com/lite/?q='+encodeURIComponent(q);}},
   bing:{t:'بینگ',u:function(q){return 'https://www.bing.com/search?q='+encodeURIComponent(q);}},
-  google:{t:'گوگل',u:function(q){return 'https://www.google.com/search?q='+encodeURIComponent(q);}},
+  brave:{t:'بریو',u:function(q){return 'https://search.brave.com/search?q='+encodeURIComponent(q);}},
+  google:{t:'گوگل (محدود)',u:function(q){return 'https://www.google.com/search?q='+encodeURIComponent(q);}},
   wiki:{t:'ویکی‌پدیا فارسی',u:function(q){return 'https://fa.wikipedia.org/w/index.php?search='+encodeURIComponent(q);}},
   yt:{t:'یوتیوب',u:function(q){return 'https://www.youtube.com/results?search_query='+encodeURIComponent(q);}}
 };
@@ -1239,7 +1287,9 @@ tabsEl.addEventListener('click',function(e){
 });
 el('newtab').addEventListener('click',function(){newTab(true);});
 /* ---------- ناوبری ---------- */
-function proxyPath(target){return backend()+'/proxy?url='+encodeURIComponent(target);}
+/* پرچم pxo: ورکر پاسخ را به «مسیر واقعی + کوکی مبدأ» برمی‌گرداند (حالت SPA)
+   تا مسیریابی تک‌صفحه‌ای سایت‌ها (بی‌بی‌سی، DW و…) درست کار کند */
+function proxyPath(target){return backend()+'/proxy?url='+encodeURIComponent(target)+'&pxo=1';}
 /* فراخوانی API پنل IP روی سرورِ فعال — اگر سرور فعال روی مبدأ دیگری است،
    درخواست از مسیر پروکسیِ همین مبدأ می‌رود تا مقصد به هدر Origin حساس نباشد
    و سایت‌های دیگر هم نتوانند حالت خروجی سرور را عوض کنند. */
@@ -1258,15 +1308,34 @@ function smartUrl(v){
   var eng=ENGINES[settings.engine]||ENGINES.ddg;
   return eng.u(v);
 }
+/* ---------- نوار پیشرفت بارگیری ---------- */
+var pbarEl=el('pbar'),pbarTimer=null;
+function pbarStart(){
+  pbarEl.classList.remove('on','done');
+  pbarEl.querySelector('i').style.transition='none';
+  pbarEl.querySelector('i').style.width='0';
+  void pbarEl.offsetWidth; /* رفرش */
+  pbarEl.querySelector('i').style.transition='';
+  pbarEl.classList.add('on');
+  clearTimeout(pbarTimer);
+}
+function pbarEnd(){
+  clearTimeout(pbarTimer);
+  if(!pbarEl.classList.contains('on'))return;
+  pbarEl.classList.add('done');
+  pbarTimer=setTimeout(function(){pbarEl.classList.remove('on','done');},350);
+}
 function navigate(target){
   if(!active)newTab(true);
   active.url=target;
+  pbarStart();
   active.frame.src=proxyPath(target);
   setAddr(target);
   renderTabs();
   updateNav();
 }
 function onLoad(t){
+  if(t.id===active.id)pbarEnd();
   if(t.id!==active.id){renderTabs();return;}
   syncFromFrame(t);
 }
@@ -1288,6 +1357,13 @@ function targetFromLoc(loc,doc){
     var m=/^\\/(https?:\\/.+)$/.exec(p);
     if(m){var raw=m[1];try{raw=decodeURIComponent(raw);}catch(e){}
       return raw+(loc.search||'');}
+    /* حالت SPA: سند در مسیر واقعی خودش سرو شده؛ نشانی کامل از متای px-target */
+    if(doc&&doc.querySelector){
+      var mt2=doc.querySelector('meta[name="px-target"]');
+      if(mt2&&mt2.content){
+        try{return new URL(loc.pathname+(loc.search||''),mt2.content).href;}catch(e){return mt2.content;}
+      }
+    }
     return '';
   }catch(e){return '';}
 }
@@ -1303,7 +1379,8 @@ function syncFromFrame(t){
   }catch(e){}
   t.url=target;t.title=title;
   if(t.hi<0||t.hist[t.hi]!==target){t.hist=t.hist.slice(0,t.hi+1);t.hist.push(target);t.hi=t.hist.length-1;}
-  if(!t.incognito&&target){history.unshift({u:target,t:title,at:Date.now()});
+  /* ثبت تاریخچه فقط وقتی نشانی عوض شده (نه در هر بارگذاری مجدد) */
+  if(!t.incognito&&target&&(!history.length||history[0].u!==target)){history.unshift({u:target,t:title,at:Date.now()});
     if(history.length>300)history.length=300;lsSet(LS.h,history);}
   if(t.id===active.id){setAddr(target);updateStar();updateNav();
     document.title=(target?title+' — ':'')+'وب‌پروکسی';}
@@ -1322,12 +1399,14 @@ function goHist(d){
   if(ni<0||ni>=active.hist.length)return;
   active.hi=ni;
   var u=active.hist[ni];
+  pbarStart();
   if(u){active.url=u;active.frame.src=proxyPath(u);setAddr(u);}
   else{active.url='';active.frame.src='/newtab';setAddr('');}
   renderTabs();updateNav();
 }
 function reloadTab(){
   if(!active)return;
+  pbarStart();
   try{active.frame.contentWindow.location.reload();}catch(e){
     if(active.url)active.frame.src=proxyPath(active.url);else active.frame.src='/newtab';}
 }
@@ -1447,11 +1526,13 @@ function showBookmarks(){
   });
 }
 function showAbout(){
+  var cur=settings.backends[settings.active];
   openPanel({t:'درباره',b:
-   '<p class="tiny">مرورگر پروکسی شخصی — نسخه ۴٫۳</p>'
-   +'<p class="tiny">جدید در ۴٫۳: بخش «کانفیگ‌های آماده (گیت‌هاب)» — کانفیگ‌های رایگان V2Ray از مخازن عمومی، با لینک اشتراک آماده برای v2rayNG/Hiddify. مرورگر تصویری (ریموت): سایت‌ها را به‌صورت عکس با لینک‌های شماره‌دار ببین.</p>'
+   '<p class="tiny">مرورگر پروکسی شخصی — نسخه ۴٫۴</p>'
+   +'<p class="tiny">لایه‌ی فعال: <b>'+esc2(cur?cur.name:'—')+'</b>'+(cur?' <span style="direction:ltr;display:inline-block">('+esc2(cur.url)+')</span>':'')+'</p>'
+   +'<p class="tiny">جدید در ۴٫۴: پشتیبانی کامل اپ‌های تک‌صفحه‌ای (بی‌بی‌سی فارسی و DW فارسی که قبلاً خراب می‌شدند)، موتور جستجوی سبک‌تر و پایدارتر + جستجوی بریو، دکمه‌های بزرگ‌تر برای لمس، نوار پیشرفت بارگیری و اصلاح کنتراست متن‌ها.</p>'
   +'<p class="tiny">تمام صفحات از طریق سرور واسط باز می‌شوند؛ لینک‌ها، تصاویر، فرم‌ها و درخواست‌های داینامیک هم از مسیر پروکسی رد می‌شوند. پشتیبانی پخش یوتیوب با کیفیت انتخابی، موتور سرعت با اتصال‌های زنده و — روی لایه‌های Node — تغییر IP خروجی.</p>'
-  +'<p class="tiny">میان‌برها: <b>Ctrl+T</b> تب جدید · <b>Ctrl+W</b> بستن تب · <b>Ctrl+L</b> نوار آدرس · <b>Ctrl+D</b> نشانک · <b>Ctrl+F</b> جستجو در صفحه · <b>Alt+→/←</b> عقب/جلو · <b>Ctrl +/-/0</b> بزرگ‌نمایی</p>'});
+  +'<p class="tiny">میان‌برها (کیبورد): <b>Ctrl+T</b> تب جدید · <b>Ctrl+W</b> بستن تب · <b>Ctrl+L</b> نوار آدرس · <b>Ctrl+D</b> نشانک · <b>Ctrl+F</b> جستجو در صفحه · <b>Alt+→/←</b> عقب/جلو · <b>Ctrl +/-/0</b> بزرگ‌نمایی</p>'});
 }
 /* ---------- تنظیمات و سوییچ سرور ---------- */
 function showSettings(){
@@ -1462,7 +1543,7 @@ function showSettings(){
       +'<input type="radio" name="bk" data-i="'+i+'"'+(i===settings.active?' checked':'')+'>'
       +'<span class="bn">'+esc2(b.name)+'</span><span class="bu">'+esc2(b.url)+'</span>'
       +'<span class="ms" id="ms'+i+'"></span>'
-      +'<button class="pbtn dngr" data-rm="'+i+'">حذف</button></div>';
+      +(settings.backends.length>1?'<button class="pbtn dngr" data-rm="'+i+'">حذف</button>':'')+'</div>';
   }
   var engs='';
   var keys=Object.keys(ENGINES);
@@ -1489,6 +1570,7 @@ function showSettings(){
   });
   var rm=panelbox.querySelectorAll('[data-rm]');
   for(var k=0;k<rm.length;k++)rm[k].onclick=function(){
+    if(settings.backends.length<2){alert('حداقل یک سرور لازم است — اول سرور دیگری اضافه کن.');return;}
     var i=Number(this.getAttribute('data-rm'));
     settings.backends.splice(i,1);
     if(settings.active>=settings.backends.length)settings.active=0;
@@ -1678,6 +1760,11 @@ function clearMarks(){
   }catch(e){}
   marks=[];el('fcount').textContent='۰/۰';
 }
+function faNum(n){
+  var d='۰۱۲۳۴۵۶۷۸۹',s=String(n),o='';
+  for(var i=0;i<s.length;i++){var c=s.charCodeAt(i);o+=(c>=48&&c<=57)?d.charAt(c-48):s.charAt(i);}
+  return o;
+}
 function doFind(q){
   clearMarks();
   if(!q)return;
@@ -1711,7 +1798,7 @@ function stepFind(d,reset){
   fIdx=(fIdx+d+marks.length)%marks.length;
   marks[fIdx].classList.add('on');
   try{marks[fIdx].scrollIntoView({block:'center'});}catch(e){}
-  el('fcount').textContent=(fIdx+1)+'/'+marks.length;
+  el('fcount').textContent=faNum(fIdx+1)+'/'+faNum(marks.length);
 }
 /* ---------- بزرگ‌نمایی ---------- */
 function setZoom(z){
@@ -1840,7 +1927,11 @@ button:hover{filter:brightness(1.1)}
 .tile:hover{transform:translateY(-3px);border-color:#38bdf8;color:#fff}
 .tile .ic{width:38px;height:38px;border-radius:11px;display:flex;align-items:center;justify-content:center;
   font-size:17px;font-weight:700;color:#fff}
-.hint{margin-top:30px;color:#5d7295;font-size:12px;line-height:2.2}
+.hint{margin-top:30px;color:#8195b8;font-size:12px;line-height:2.2}
+#layer{margin-top:18px;display:inline-flex;align-items:center;gap:7px;padding:7px 16px;border-radius:20px;
+  background:rgba(17,26,46,.7);border:1px solid #1d2a44;color:#93a5c4;font-size:12px}
+#layer b{color:#7dd3fc;font-weight:600}
+#layer .dot{width:7px;height:7px;border-radius:50%;background:#0ea5e9}
 </style>
 </head>
 <body>
@@ -1852,6 +1943,7 @@ button:hover{filter:brightness(1.1)}
     <select id="eng">
       <option value="ddg">داک‌داک‌گو</option>
       <option value="bing">بینگ</option>
+      <option value="brave">بریو</option>
       <option value="google">گوگل</option>
       <option value="wiki">ویکی‌پدیا</option>
       <option value="yt">یوتیوب</option>
@@ -1859,14 +1951,16 @@ button:hover{filter:brightness(1.1)}
     <button type="submit">برو</button>
   </form>
   <div class="tiles" id="tiles"></div>
-  <div class="hint">پخش یوتیوب پشتیبانی می‌شود · با ⭐/☆ نشانک کن · Ctrl+T تب جدید</div>
+  <div id="layer" hidden><span class="dot"></span>لایه‌ی فعال: <b></b></div>
+  <div class="hint">پخش یوتیوب پشتیبانی می‌شود · با ⭐ نشانک کن · سایتی که می‌خواهی را در نوار بالا بنویس</div>
 </div>
 <script>
 (function(){
 'use strict';
 var ENGINES={
-  ddg:function(q){return 'https://html.duckduckgo.com/html/?q='+encodeURIComponent(q);},
+  ddg:function(q){return 'https://lite.duckduckgo.com/lite/?q='+encodeURIComponent(q);},
   bing:function(q){return 'https://www.bing.com/search?q='+encodeURIComponent(q);},
+  brave:function(q){return 'https://search.brave.com/search?q='+encodeURIComponent(q);},
   google:function(q){return 'https://www.google.com/search?q='+encodeURIComponent(q);},
   wiki:function(q){return 'https://fa.wikipedia.org/w/index.php?search='+encodeURIComponent(q);},
   yt:function(q){return 'https://www.youtube.com/results?search_query='+encodeURIComponent(q);}
@@ -1876,10 +1970,12 @@ var TILES=[
   {t:'کانفیگ‌ها',u:'/configs',c:'#059669',i:'⚙'},
   {t:'یوتیوب',u:'https://www.youtube.com/',c:'#f43f5e',i:'▶'},
   {t:'BBC فارسی',u:'https://www.bbc.com/persian',c:'#b91c1c',i:'B'},
-  {t:'ویکی‌پدیا',u:'https://fa.wikipedia.org/',c:'#334155',i:'W'},
-  {t:'DW فارسی',u:'https://www.dw.com/fa/',c:'#1d4ed8',i:'D'},
+  {t:'یورونیوز فارسی',u:'https://persian.euronews.com/',c:'#0e7490',i:'ی'},
   {t:'رادیو فردا',u:'https://www.radiofarda.com/',c:'#c2410c',i:'ر'},
-  {t:'ایران اینتل',u:'https://www.iranintl.com/',c:'#0e7490',i:'I'},
+  {t:'ایران اینتل',u:'https://www.iranintl.com/',c:'#0891b2',i:'I'},
+  {t:'رادیو زمانه',u:'https://www.radiozamaneh.com/',c:'#0f766e',i:'ز'},
+  {t:'دیجیاتو',u:'https://digiato.com/',c:'#7c3aed',i:'د'},
+  {t:'ویکی‌پدیا',u:'https://fa.wikipedia.org/',c:'#334155',i:'W'},
   {t:'گاردین',u:'https://www.theguardian.com/',c:'#1e3a8a',i:'G'},
   {t:'گوگل',u:'https://www.google.com/',c:'#374151',i:'g'}
 ];
@@ -1908,6 +2004,16 @@ document.getElementById('sf').addEventListener('submit',function(e){
   var url=ENGINES[eng]?ENGINES[eng](q):q;
   go(url);
 });
+/* هم‌گامی با تنظیمات شل: موتور پیش‌فرض و نام لایه‌ی فعال */
+try{
+  var sh=JSON.parse(localStorage.getItem('pxsh_settings')||'null');
+  if(sh&&sh.engine&&ENGINES[sh.engine])document.getElementById('eng').value=sh.engine;
+  var cur=sh&&sh.backends?sh.backends[sh.active||0]:null;
+  if(cur&&cur.name){
+    var lb=document.getElementById('layer');
+    lb.hidden=false;lb.querySelector('b').textContent=cur.name;
+  }
+}catch(e){}
 })();
 </script>
 </body>

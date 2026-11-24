@@ -500,8 +500,8 @@ body{display:flex;flex-direction:column;background:#0b1220;color:#e7edf8;
 #status{color:#8fa2c4;font-size:12.5px;flex:1;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
 /* --- اکشن‌ها --- */
 .acts{display:flex;gap:8px;flex-wrap:wrap;margin-bottom:14px}
-.pbtn{padding:9px 16px;border-radius:10px;border:1px solid #2a3a5c;background:#131f39;color:#c7d5ee;
-  cursor:pointer;font-family:inherit;font-size:12.5px}
+.pbtn{padding:11px 18px;border-radius:10px;border:1px solid #2a3a5c;background:#131f39;color:#c7d5ee;
+  cursor:pointer;font-family:inherit;font-size:13px}
 .pbtn:hover{border-color:#34d399;color:#6ee7b7}
 .pbtn.pri{background:linear-gradient(135deg,#059669,#34d399);color:#03231a;border:0;font-weight:700}
 .pbtn[disabled]{opacity:.4;cursor:default}
@@ -515,9 +515,10 @@ body{display:flex;flex-direction:column;background:#0b1220;color:#e7edf8;
 .cfg .tt{flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
 .cfg .hh{flex:0 0 auto;max-width:38%;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;
   color:#5d7295;font-size:10.5px;direction:ltr}
-.cfg .cp{flex:0 0 auto;padding:5px 11px;border-radius:8px;border:1px solid #2a3a5c;background:#0d1730;
-  color:#7dd3fc;cursor:pointer;font-family:inherit;font-size:11.5px}
+.cfg .cp{flex:0 0 auto;padding:9px 15px;border-radius:9px;border:1px solid #2a3a5c;background:#0d1730;
+  color:#7dd3fc;cursor:pointer;font-family:inherit;font-size:12px}
 .cfg .cp:hover{border-color:#38bdf8}
+.cfg .cp:active{background:#132444}
 /* --- راهنما --- */
 .guide{margin-top:16px;border:1px solid #1b2740;border-radius:12px;background:rgba(13,23,48,.6)}
 .guide summary{padding:11px 14px;cursor:pointer;color:#c7d5ee;font-size:13px;user-select:none}

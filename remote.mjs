@@ -439,12 +439,12 @@ html,body{height:100%}
 body{display:flex;flex-direction:column;background:#0b1220;color:#e7edf8;
   font-family:"Segoe UI",Tahoma,"Vazirmatn",sans-serif;font-size:14px;overflow:hidden}
 #top{display:flex;align-items:center;gap:5px;padding:7px 10px;background:#0b1220;border-bottom:1px solid #1b2740}
-.nbtn{width:34px;height:34px;border-radius:9px;border:0;background:transparent;color:#a9bcd9;
+.nbtn{width:40px;height:40px;border-radius:10px;border:0;background:transparent;color:#a9bcd9;
   cursor:pointer;font-size:15px;flex:0 0 auto;display:inline-flex;align-items:center;justify-content:center;font-family:inherit}
 .nbtn:hover{background:#131f39;color:#e7edf8}
 .nbtn.dis{opacity:.3;cursor:default}
 .nbtn.dis:hover{background:transparent;color:#a9bcd9}
-#addr{flex:1;min-width:60px;padding:9px 14px;border-radius:18px;border:1px solid #24334f;background:#0d1730;
+#addr{flex:1;min-width:60px;padding:11px 14px;border-radius:18px;border:1px solid #24334f;background:#0d1730;
   color:#e7edf8;font-size:13.5px;outline:none;direction:ltr;text-align:left;font-family:inherit;transition:border-color .15s}
 #addr:focus{border-color:#38bdf8}
 #bgo{padding:9px 17px;border-radius:18px;border:0;background:linear-gradient(135deg,#0ea5e9,#22d3ee);
@@ -488,8 +488,8 @@ h3{font-size:13.5px;color:#c7d5ee;margin:20px 2px 10px;display:flex;align-items:
 .lnk{display:flex;align-items:center;gap:9px;padding:8px 10px;border-radius:10px;background:#101a30;
   border:1px solid #1b2740;color:#c7d5ee;cursor:pointer;text-align:right;font-family:inherit;font-size:12.5px;min-width:0}
 .lnk:hover{border-color:#38bdf8;color:#fff}
-.lnk b{flex:0 0 auto;width:26px;height:26px;border-radius:8px;background:#1d2a44;color:#7dd3fc;
-  display:inline-flex;align-items:center;justify-content:center;font-size:12.5px}
+.lnk b{flex:0 0 auto;width:28px;height:28px;border-radius:8px;background:#1d2a44;color:#7dd3fc;
+  display:inline-flex;align-items:center;justify-content:center;font-size:13px}
 .lnk .lt{flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
 .lnk .lu{flex:0 0 auto;max-width:36%;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;
   color:#5d7295;font-size:10.5px;direction:ltr}
@@ -730,10 +730,11 @@ $('zoom').onclick=function(){this.hidden=true;$('zimg').removeAttribute('src');}
 
 var TILES=[
   ['بی‌بی‌سی فارسی','https://www.bbc.com/persian','#b91c1c','B'],
+  ['یورونیوز فارسی','https://persian.euronews.com/','#0e7490','ی'],
   ['ویکی‌پدیا','https://fa.wikipedia.org/','#334155','W'],
-  ['DW فارسی','https://www.dw.com/fa/','#1d4ed8','D'],
+  ['رادیو زمانه','https://www.radiozamaneh.com/','#0f766e','ز'],
   ['رادیو فردا','https://www.radiofarda.com/','#c2410c','ر'],
-  ['ایران اینتل','https://www.iranintl.com/','#0e7490','I'],
+  ['ایران اینتل','https://www.iranintl.com/','#0891b2','I'],
   ['گاردین','https://www.theguardian.com/','#1e3a8a','G'],
   ['گوگل','https://www.google.com/','#374151','g'],
   ['یوتیوب','https://www.youtube.com/','#f43f5e','▶']

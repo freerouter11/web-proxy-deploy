@@ -29,6 +29,9 @@ import { handleRemote } from './remote.mjs';
 import { handleConfigs } from './configs.mjs';
 import { HLS_JS } from './assets.js';
 
+/* مسیرهای رزروشده‌ی داخلی — در حالت SPA نباید به کوکی مبدأ برند */
+const RESERVED_PATH = /^(\/$|\/newtab$|\/remote$|\/configs$|\/yt(?:\/|$)|\/login$|\/logout$|\/health$|\/favicon\.ico$|\/assets\/|\/api\/|\/_ip|\/proxy$|\/shot$|\/__)/i;
+
 /* --------------------------- کش Cloudflare --------------------------- */
 
 const CACHE = (typeof caches !== 'undefined') ? caches.default : null; // در محیط تست Node در دسترس نیست
@@ -303,10 +306,13 @@ export default {
 
       /* ---------- پروکسی عمومی ---------- */
       let target = null;
+      let pxoNav = false;   /* پرچم حالت SPA — درخواست ناوبری از شل/لینک */
+      let originMode = false; /* درخواست از طریق کوکی مبدأ (مسیر واقعی) */
 
       if (url.pathname === '/proxy') {
         target = url.searchParams.get('url');
-        const extra = [...url.searchParams.entries()].filter(([k]) => k !== 'url');
+        pxoNav = url.searchParams.get('pxo') === '1';
+        const extra = [...url.searchParams.entries()].filter(([k]) => k !== 'url' && k !== 'pxo');
         if (target && extra.length) {
           const t = new URL(normalizeTarget(target));
           for (const [k, v] of extra) t.searchParams.append(k, v);
@@ -322,7 +328,7 @@ export default {
           const cookies = parseCookies(request.headers.get('cookie') || '');
           const origin = cookies[ORIGIN_COOKIE];
           if (origin) {
-            try { target = new URL(path + url.search, origin).href; } catch (_) { target = null; }
+            try { target = new URL(path + url.search, origin).href; originMode = true; } catch (_) { target = null; }
           }
         }
       }
@@ -351,7 +357,25 @@ export default {
       const ytRoute = isDocReq ? ytRouteFor(turl) : null;
       if (ytRoute) return new Response(null, { status: 302, headers: { location: ytRoute } });
 
-      return await proxyFetch(request, turl.href, ctx, sid);
+      /* حالت SPA: ناوبری با پرچم pxo → سند در «مسیر واقعی» خودش سرو می‌شود
+         (کوکی مبدأ فعال) تا مسیریابی تک‌صفحه‌ای سایت‌ها (بی‌بی‌سی، DW و…)
+         location.pathname را درست ببینند. فقط برای مسیرهای غیررزرو. */
+      if (pxoNav && (request.method === 'GET' || request.method === 'HEAD') && isDocReq
+          && !RESERVED_PATH.test(turl.pathname)
+          && /text\/html/.test(request.headers.get('accept') || '*/*')) {
+        try {
+          const rh = new Headers({
+            'location': turl.pathname + turl.search,
+            'cache-control': 'no-store',
+            'x-px-spa': '1',
+          });
+          rh.append('set-cookie', ORIGIN_COOKIE + '=' + encodeURIComponent(turl.origin) + '; Path=/; HttpOnly; SameSite=Lax; Max-Age=86400');
+          rh.append('set-cookie', 'px_last=' + encodeURIComponent(turl.href) + '; Path=/; SameSite=Lax; Max-Age=86400');
+          return new Response(null, { status: 302, headers: rh });
+        } catch (_) { /* ریدایرکت ممکن نشد — مسیر عادی */ }
+      }
+
+      return await proxyFetch(request, turl.href, ctx, sid, originMode);
     } catch (e) {
       return html(500, errorPage(500, 'خطای داخلی سرور.', '', e && e.message));
     }
@@ -447,7 +471,7 @@ const FWD_HEADERS = ['sec-ch-ua', 'sec-ch-ua-mobile', 'sec-ch-ua-platform',
   'sec-ch-ua-platform-version', 'sec-ch-ua-full-version-list', 'sec-ch-ua-model', 'sec-ch-ua-arch',
   'sec-fetch-dest', 'sec-fetch-mode', 'sec-fetch-site', 'sec-fetch-user', 'dnt', 'upgrade-insecure-requests'];
 
-async function proxyFetch(request, targetUrl, ctx, sid) {
+async function proxyFetch(request, targetUrl, ctx, sid, originMode) {
   let method = request.method;
   let body;
   if (method !== 'GET' && method !== 'HEAD') {
@@ -461,7 +485,7 @@ async function proxyFetch(request, targetUrl, ctx, sid) {
      فقط صفحات عمومی کش می‌شوند (بدون کوکی شخصی و بدون set-cookie مبدأ). */
   if (method === 'GET' && CACHE) {
     try {
-      const hit = await CACHE.match(new Request('https://pxcache.internal/page/' + targetUrl));
+      const hit = await CACHE.match(new Request('https://pxcache.internal/page-v44/' + targetUrl));
       if (hit) {
         const h = new Headers();
         h.set('content-type', 'text/html; charset=utf-8');
@@ -472,7 +496,10 @@ async function proxyFetch(request, targetUrl, ctx, sid) {
         const dest = request.headers.get('sec-fetch-dest');
         const fin = hit.headers.get('x-px-final');
         if ((!dest || dest === 'document') && fin) {
-          try { h.append('set-cookie', ORIGIN_COOKIE + '=' + encodeURIComponent(new URL(fin).origin) + '; Path=/; HttpOnly; SameSite=Lax; Max-Age=86400'); } catch (_) { }
+          try {
+            h.append('set-cookie', ORIGIN_COOKIE + '=' + encodeURIComponent(new URL(fin).origin) + '; Path=/; HttpOnly; SameSite=Lax; Max-Age=86400');
+            h.append('set-cookie', 'px_last=' + encodeURIComponent(fin) + '; Path=/; SameSite=Lax; Max-Age=86400');
+          } catch (_) { }
         }
         return new Response(await hit.text(), { status: 200, headers: h });
       }
@@ -566,14 +593,18 @@ async function proxyFetch(request, targetUrl, ctx, sid) {
   const setCookies = [SID_COOKIE + '=' + (sid || newSid()) + '; Path=/; HttpOnly; Secure; SameSite=Lax; Max-Age=31536000'];
   if (isHtml) {
     const dest = request.headers.get('sec-fetch-dest');
-    if (!dest || dest === 'document') {
+    /* حالت SPA (درخواست با کوکی مبدأ) یا بازدید مستقیم سند:
+       کوکی مبدأ + نشانی کامل (px_last خوانا — برای فیلوور اپ اندروید).
+       فریم‌های جاسازی‌شده کوکی مبدأ را عوض نمی‌کنند (خرابکاری در صفحه‌ی والد). */
+    if (originMode || !dest || dest === 'document') {
       try {
         setCookies.push(ORIGIN_COOKIE + '=' + encodeURIComponent(new URL(finalUrl).origin) + '; Path=/; HttpOnly; SameSite=Lax; Max-Age=86400');
+        setCookies.push('px_last=' + encodeURIComponent(finalUrl) + '; Path=/; SameSite=Lax; Max-Age=86400');
       } catch (_) { /* نادیده گرفته می‌شود */ }
     }
   }
   out.append('set-cookie', setCookies[0]);
-  if (setCookies[1]) out.append('set-cookie', setCookies[1]);
+  for (let sci = 1; sci < setCookies.length; sci++) out.append('set-cookie', setCookies[sci]);
 
   if (resp.status === 204 || resp.status === 304 || method === 'HEAD') {
     try { if (resp.body) await resp.body.cancel(); } catch (_) { /* بسته */ }
@@ -593,15 +624,18 @@ async function proxyFetch(request, targetUrl, ctx, sid) {
     let text = dec.decode(buf);
     text = isHtml ? rewriteHtml(text, finalUrl) : rewriteCss(text, finalUrl);
     // کش کوتاه صفحه (۳۰ث) — فقط صفحات عمومی؛ کلید روی نشانی درخواستی و نهایی (ریدایرکت‌ها)
+    // ایراد قبلی: پاسخِ ذخیره‌شده cache-control نداشت → TTL پیش‌فرضِ کلادفلر (~۲ ساعت)
+    // یعنی صفحات قدیمی ساعت‌ها می‌ماندند و دیپلوی‌های جدید دیر اثر می‌کردند.
+    // نسخه‌ی کلید (v44) با هر تغییرِ پچ کلاینت عوض می‌شود تا کل کشِ قدیمی بی‌اثر شود.
     if (isHtml && method === 'GET' && CACHE && resp.status === 200 && !personalized
       && !resp.headers.get('set-cookie') && text.length <= 768 * 1024 && !/https?:\/\/[^/@]+@/.test(targetUrl)) {
       const mk = () => new Response(text, {
-        headers: { 'content-type': 'text/html; charset=utf-8', 'x-px-final': finalUrl },
+        headers: { 'content-type': 'text/html; charset=utf-8', 'x-px-final': finalUrl, 'cache-control': 'public, max-age=30' },
       });
       out.set('x-px-cache', 'MISS');
-      ctx.waitUntil(CACHE.put(new Request('https://pxcache.internal/page/' + targetUrl), mk()).catch(() => {}));
+      ctx.waitUntil(CACHE.put(new Request('https://pxcache.internal/page-v44/' + targetUrl), mk()).catch(() => {}));
       if (finalUrl !== targetUrl) {
-        ctx.waitUntil(CACHE.put(new Request('https://pxcache.internal/page/' + finalUrl), mk()).catch(() => {}));
+        ctx.waitUntil(CACHE.put(new Request('https://pxcache.internal/page-v44/' + finalUrl), mk()).catch(() => {}));
       }
     }
     return new Response(text, { status: resp.status, headers: out });

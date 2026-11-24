@@ -36,6 +36,12 @@ import {
 import { handleRemote } from './remote.mjs';
 import { handleConfigs } from './configs.mjs';
 
+/* مسیرهای رزروشده‌ی داخلی — در حالت SPA نباید به کوکی مبدأ برند */
+const RESERVED_PATH_CHECK = (p) => p === '/' || p === '/newtab' || p === '/remote' || p === '/configs'
+  || p.startsWith('/yt/') || p === '/yt' || p === '/login' || p === '/logout' || p === '/health'
+  || p === '/favicon.ico' || p.startsWith('/assets/') || p.startsWith('/api/')
+  || p.startsWith('/_ip') || p === '/proxy' || p === '/shot' || p.startsWith('/__');
+
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
 /* ---------------------------- تنظیمات ---------------------------- */
@@ -667,7 +673,7 @@ async function hlsRequest(req, res, u) {
 
 /* --------------------------- پروکسی اصلی --------------------------- */
 
-async function proxyRequest(targetUrl, req, res, bodyBuf, sid) {
+async function proxyRequest(targetUrl, req, res, bodyBuf, sid, originMode) {
   const method = ['GET', 'HEAD', 'POST', 'PUT', 'PATCH', 'DELETE'].includes(req.method) ? req.method : 'GET';
 
   // کش ایستاها
@@ -717,10 +723,15 @@ async function proxyRequest(targetUrl, req, res, bodyBuf, sid) {
 
   if (isHtml) {
     const dest = req.headers['sec-fetch-dest'];
-    if (!dest || dest === 'document') {
+    /* حالت SPA (درخواست با کوکی مبدأ) یا بازدید مستقیم سند:
+       کوکی مبدأ + نشانی کامل (px_last خوانا — برای فیلوور اپ اندروید).
+       فریم‌های جاسازی‌شده کوکی مبدأ را عوض نمی‌کنند. */
+    if (originMode || !dest || dest === 'document') {
       try {
         setCookies.push(ORIGIN_COOKIE + '=' + encodeURIComponent(new URL(finalUrl).origin) +
           '; Path=/; HttpOnly; SameSite=Lax; Max-Age=86400');
+        setCookies.push('px_last=' + encodeURIComponent(finalUrl) +
+          '; Path=/; SameSite=Lax; Max-Age=86400');
       } catch (_) { /* نادیده گرفته می‌شود */ }
     }
   }
@@ -1044,10 +1055,13 @@ async function handle(req, res) {
 
   /* ---------- پروکسی عمومی ---------- */
   let target = null;
+  let pxoNav = false;   /* پرچم حالت SPA — درخواست ناوبری از شل/لینک */
+  let originMode = false; /* درخواست از طریق کوکی مبدأ (مسیر واقعی) */
 
   if (u.pathname === '/proxy') {
     target = u.searchParams.get('url');
-    const extra = [...u.searchParams.entries()].filter(([k]) => k !== 'url');
+    pxoNav = u.searchParams.get('pxo') === '1';
+    const extra = [...u.searchParams.entries()].filter(([k]) => k !== 'url' && k !== 'pxo');
     if (target && extra.length) {
       const t = new URL(normalizeTarget(target));
       for (const [k, v] of extra) t.searchParams.append(k, v);
@@ -1063,7 +1077,7 @@ async function handle(req, res) {
       const cookies = parseCookies(req.headers.cookie);
       const origin = cookies[ORIGIN_COOKIE];
       if (origin) {
-        try { target = new URL(p + u.search, origin).href; } catch (_) { target = null; }
+        try { target = new URL(p + u.search, origin).href; originMode = true; } catch (_) { target = null; }
       }
     }
   }
@@ -1095,10 +1109,27 @@ async function handle(req, res) {
     return sendHtml(res, 403, errorPage(403, 'دسترسی به آدرس‌های داخلی/لوکال از طریق پروکسی مجاز نیست.', target));
   }
 
+  /* حالت SPA: ناوبری با پرچم pxo → سند در «مسیر واقعی» خودش سرو می‌شود
+     (کوکی مبدأ فعال) تا مسیریابی تک‌صفحه‌ای سایت‌ها درست کار کند. */
+  if (pxoNav && (req.method === 'GET' || req.method === 'HEAD') && isDocReq
+      && !RESERVED_PATH_CHECK(turl.pathname)
+      && /text\/html/.test(req.headers['accept'] || '*/*')) {
+    res.writeHead(302, {
+      location: turl.pathname + turl.search,
+      'cache-control': 'no-store',
+      'x-px-spa': '1',
+      'set-cookie': [
+        ORIGIN_COOKIE + '=' + encodeURIComponent(turl.origin) + '; Path=/; HttpOnly; SameSite=Lax; Max-Age=86400',
+        'px_last=' + encodeURIComponent(turl.href) + '; Path=/; SameSite=Lax; Max-Age=86400',
+      ],
+    });
+    return res.end();
+  }
+
   const bodyBuf = (req.method === 'POST' || req.method === 'PUT' || req.method === 'PATCH')
     ? await readBody(req) : undefined;
 
-  return proxyRequest(turl.href, req, res, bodyBuf, sid);
+  return proxyRequest(turl.href, req, res, bodyBuf, sid, originMode);
 }
 
 /* --------------------------- اجرای سرور --------------------------- */
