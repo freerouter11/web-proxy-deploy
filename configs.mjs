@@ -76,9 +76,8 @@ function sourceById(id) {
 
 /* ---------------------------- ابزارهای کوچک ---------------------------- */
 
-const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
-
-function tSignal(ms) {
+/* توابع کمکی با نام‌های cfg اختصاصی — تا در باندلِ تک‌فایلی با remote.mjs تداخل نکنند */
+function cfgSignal(ms) {
   try {
     const ac = new AbortController();
     const t = setTimeout(() => { try { ac.abort(); } catch (_) {} }, ms);
@@ -87,7 +86,7 @@ function tSignal(ms) {
   } catch (_) { return undefined; }
 }
 
-function jsonResp(obj, status) {
+function cfgJson(obj, status) {
   return new Response(JSON.stringify(obj), {
     status: status || 200,
     headers: {
@@ -98,7 +97,7 @@ function jsonResp(obj, status) {
   });
 }
 
-function textResp(msg, status, ctype) {
+function cfgText(msg, status, ctype) {
   return new Response(msg, {
     status: status || 400,
     headers: {
@@ -317,7 +316,7 @@ async function fetchSub(key, url) {
         'accept': 'text/plain,*/*;q=0.8',
       },
       redirect: 'follow',
-      signal: tSignal(FETCH_TIMEOUT),
+      signal: cfgSignal(FETCH_TIMEOUT),
     });
   } catch (e) {
     const aborted = e && (e.name === 'AbortError' || e.name === 'TimeoutError');
@@ -361,7 +360,7 @@ function rawSubscription(origin, srcId, list, n, random, total, customUrl) {
   const head = '# اشتراک کانفیگ‌های رایگان — منبع: ' + srcId + ' (جمع‌آوری از مخازن عمومی گیت‌هاب)\n'
     + '# تعداد کل در منبع: ' + total + (picked.length < total ? ' — اینجا ' + picked.length + ' مورد' : '') + '\n'
     + '# برای افزودن در v2rayNG: اشتراک ← سه‌نقطه ← افزودن — همین نشانی را جای‌گذاری کن\n';
-  return textResp(head + picked.map((x) => x.u).join('\n') + '\n', 200, 'text/plain');
+  return cfgText(head + picked.map((x) => x.u).join('\n') + '\n', 200, 'text/plain');
 }
 
 /* ------------------------------- مسیریابی ------------------------------- */
@@ -395,7 +394,7 @@ export async function handleConfigs(url, cip) {
 
   /* فهرست منبع‌ها */
   if (!srcId && !customUrl) {
-    return jsonResp({
+    return cfgJson({
       ok: true,
       sources: SOURCES.map((s) => ({
         id: s.id, name: s.name, repo: s.repo, desc: s.desc,
@@ -410,13 +409,13 @@ export async function handleConfigs(url, cip) {
   let target;
   if (customUrl) {
     const safe = safeSubUrl(customUrl);
-    if (!safe) return jsonResp({ ok: false, error: 'نشانی منبع معتبر نیست — فقط http/https از سایت‌های عمومی.' });
+    if (!safe) return cfgJson({ ok: false, error: 'نشانی منبع معتبر نیست — فقط http/https از سایت‌های عمومی.' });
     key = 'url:' + safe;
     label = 'custom';
     target = safe;
   } else {
     const src = sourceById(srcId);
-    if (!src) return jsonResp({ ok: false, error: 'چنین منبعی نیست. src باید یکی از این‌ها باشد: ' + SOURCES.map((s) => s.id).join('، ') });
+    if (!src) return cfgJson({ ok: false, error: 'چنین منبعی نیست. src باید یکی از این‌ها باشد: ' + SOURCES.map((s) => s.id).join('، ') });
     key = 'id:' + src.id;
     label = src.name;
     target = src.url;
@@ -424,14 +423,14 @@ export async function handleConfigs(url, cip) {
 
   /* محدودیت نرخ فقط برای واکشی تازه */
   if (cip && cfgRateLimited('cfg|' + cip) && !cacheGet(key)) {
-    return jsonResp({ ok: false, error: 'درخواست‌های زیاد — یک دقیقه صبر کن.' }, 429);
+    return cfgJson({ ok: false, error: 'درخواست‌های زیاد — یک دقیقه صبر کن.' }, 429);
   }
 
   let sub;
   try {
     sub = await getSub(key, target);
   } catch (e) {
-    return jsonResp({ ok: false, error: String(e && e.message || e), src: label }, 502);
+    return cfgJson({ ok: false, error: String(e && e.message || e), src: label }, 502);
   }
 
   /* خروجی اشتراک خام — قابل افزودن مستقیم در v2rayNG/Hiddify */
@@ -441,7 +440,7 @@ export async function handleConfigs(url, cip) {
     return rawSubscription(url.origin, label, sub.parsed.list, n, random, sub.parsed.total, customUrl);
   }
 
-  return jsonResp({
+  return cfgJson({
     ok: true,
     src: label,
     srcId: srcId || null,
