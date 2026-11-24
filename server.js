@@ -723,7 +723,7 @@ async function proxyRequest(targetUrl, req, res, bodyBuf, sid) {
 
   if (isHtml || isCss) {
     headers['content-type'] = isHtml ? 'text/html; charset=utf-8' : 'text/css; charset=utf-8';
-    if (isHtml) headers['cache-control'] = 'no-store'; // صفحه داینامیک؛ کش نشود
+    if (isHtml) headers['cache-control'] = 'private, max-age=20, stale-while-revalidate=300'; // برگشت/جلو/بازخوانی فوری؛ تازگی ۲۰ ثانیه
     /* رفع باگ قطع صفحه: قبلاً با for-await و break استریمِ نیمه‌خوانده لغو می‌شد
        و ادامه‌ی صفحه گم می‌شد. الان با reader ادامه می‌دهیم و مستقیم می‌ریزیم. */
     res.writeHead(resp.status, headers);

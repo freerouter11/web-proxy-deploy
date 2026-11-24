@@ -458,6 +458,15 @@ function rewriteHtml(htmlText, base) {
       return parts.length ? pre + '"' + parts.join(', ') + '"' : m;
     });
 
+  // بارگذاری تنبل عکس‌ها: عکس‌های بیرون از صحنه فقط هنگام اسکرول دانلود می‌شوند
+  // (صفحه‌های خبری: صدها درخواست و چند مگابایت در بار اول کم می‌شود؛ جز ۳ عکس اول که احتمالاً در بالای صفحه‌اند)
+  let imgSeen = 0;
+  htmlText = htmlText.replace(/<img\b([^>]*)>/gi, (m, attrs) => {
+    imgSeen++;
+    if (imgSeen <= 3 || /\sloading\s*=/i.test(attrs)) return m;
+    return '<img' + attrs + ' loading="lazy" decoding="async">';
+  });
+
   htmlText = htmlText.replace(/url\(\s*(['"]?)([^'")]+)\1\s*\)/gi, (m, _q, raw) => {
     const p = proxiedPath(raw.trim(), base);
     return p ? 'url("' + p + '")' : m;
