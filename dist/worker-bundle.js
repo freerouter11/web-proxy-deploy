@@ -465,6 +465,15 @@ function rewriteHtml(htmlText, base) {
       return parts.length ? pre + '"' + parts.join(', ') + '"' : m;
     });
 
+  // بارگذاری تنبل عکس‌ها: عکس‌های بیرون از صحنه فقط هنگام اسکرول دانلود می‌شوند
+  // (صفحه‌های خبری: صدها درخواست و چند مگابایت در بار اول کم می‌شود؛ جز ۳ عکس اول که احتمالاً در بالای صفحه‌اند)
+  let imgSeen = 0;
+  htmlText = htmlText.replace(/<img\b([^>]*)>/gi, (m, attrs) => {
+    imgSeen++;
+    if (imgSeen <= 3 || /\sloading\s*=/i.test(attrs)) return m;
+    return '<img' + attrs + ' loading="lazy" decoding="async">';
+  });
+
   htmlText = htmlText.replace(/url\(\s*(['"]?)([^'")]+)\1\s*\)/gi, (m, _q, raw) => {
     const p = proxiedPath(raw.trim(), base);
     return p ? 'url("' + p + '")' : m;
@@ -1264,14 +1273,6 @@ function navigate(target){
   renderTabs();
   updateNav();
 }
-/* تبِ مرورگر تصویری — مستقیم /remote (بدون پروکسی‌کردن) */
-function openRemoteTab(){
-  newTab(true);
-  active.url='';
-  active.frame.src='/remote';
-  setAddr('');
-  renderTabs();
-}
 function onLoad(t){
   if(t.id!==active.id){renderTabs();return;}
   syncFromFrame(t);
@@ -1376,6 +1377,7 @@ function renderMenu(){
   menuEl.innerHTML=
    '<div class="mi" data-a="newtab">تب جدید<span class="sc">Ctrl+T</span></div>'
   +'<div class="mi" data-a="inc">تب ناشناس</div>'
+  +'<div class="mi" data-a="remote">مرورگر تصویری (ریموت)</div>'
   +'<div class="msep"></div>'
   +'<div class="mi" data-a="history">تاریخچه</div>'
   +'<div class="mi" data-a="bookmarks">نشانک‌ها</div>'
@@ -1384,7 +1386,6 @@ function renderMenu(){
   +'<div class="mi" data-a="zout">کوچک‌نمایی<span class="sc">Ctrl −</span></div>'
   +'<div class="mi" data-a="zreset">بازنشانی بزرگ‌نمایی<span class="sc">Ctrl 0</span></div>'
   +'<div class="msep"></div>'
-  +'<div class="mi" data-a="remote">مرورگر تصویری (ریموت)</div>'
   +'<div class="mi" data-a="settings">تنظیمات و سرورها</div>'
   +'<div class="mi" data-a="ip">تغییر IP خروجی</div>'
   +'<div class="mi" data-a="about">درباره</div>';
@@ -1395,13 +1396,13 @@ menuEl.addEventListener('click',function(e){
   var a=mi.getAttribute('data-a');
   if(a==='newtab')newTab(true);
   else if(a==='inc')newTab(true,true);
+  else if(a==='remote'){newTab(true).frame.src='/remote';}
   else if(a==='history')showHistory();
   else if(a==='bookmarks')showBookmarks();
   else if(a==='find')openFind();
   else if(a==='zin')setZoom(active?active.zoom+0.1:1);
   else if(a==='zout')setZoom(active?active.zoom-0.1:1);
   else if(a==='zreset')setZoom(1);
-  else if(a==='remote')openRemoteTab();
   else if(a==='settings')showSettings();
   else if(a==='ip')showIpPanel();
   else if(a==='about')showAbout();
@@ -1862,7 +1863,7 @@ button:hover{filter:brightness(1.1)}
     <button type="submit">برو</button>
   </form>
   <div class="tiles" id="tiles"></div>
-  <div class="hint">پخش یوتیوب پشتیبانی می‌شود · «مرورگر تصویری» سایت‌ها را عکس‌به‌عکس با شماره‌ی لینک‌ها می‌گشت · با ⭐/☆ نشانک کن · Ctrl+T تب جدید</div>
+  <div class="hint">پخش یوتیوب پشتیبانی می‌شود · با ⭐/☆ نشانک کن · Ctrl+T تب جدید</div>
 </div>
 <script>
 (function(){
@@ -1875,7 +1876,7 @@ var ENGINES={
   yt:function(q){return 'https://www.youtube.com/results?search_query='+encodeURIComponent(q);}
 };
 var TILES=[
-  {t:'مرورگر تصویری',u:'/remote',c:'#7c3aed',i:'▤'},
+  {t:'مرورگر تصویری',u:'/remote',c:'#7c3aed',i:'▣'},
   {t:'یوتیوب',u:'https://www.youtube.com/',c:'#f43f5e',i:'▶'},
   {t:'BBC فارسی',u:'https://www.bbc.com/persian',c:'#b91c1c',i:'B'},
   {t:'ویکی‌پدیا',u:'https://fa.wikipedia.org/',c:'#334155',i:'W'},
@@ -1896,7 +1897,7 @@ for(var i=0;i<TILES.length;i++){
   })(TILES[i]);
 }
 function go(url){
-  if(url.charAt(0)==='/'){location.href=url;return;}
+  if(url.charAt(0)==='/'){location.href=url;return;} // مسیر داخلی مثل مرورگر تصویری
   if(window.parent&&window.parent!==window){
     try{window.parent.postMessage({px:'go',url:url},'*');return;}catch(e){}
   }
@@ -2312,10 +2313,12 @@ function  remotePage() {
 
 /**
  * هندلر مشترک؛ اگر مسیر مالِ ما نبود null برمی‌گرداند.
- * @param {string} path مسیر decode شده (مثل /remote)
- * @param {URL} url شیء URL درخواست
+ * @param {URL} url شیء URL کامل درخواست (path از خودش گرفته می‌شود)
  */
-async function  handleRemote(path, url) {
+async function  handleRemote(url) {
+  // مسیرهای خراب (مثل /%) اینجا هم نباید Exception بدهند — الگوی مشترک worker/server
+  let path;
+  try { path = decodeURI(url.pathname); } catch (_) { path = url.pathname; }
   if (path === '/remote') return remotePage();
 
   if (path === '/api/nav') {
@@ -2861,15 +2864,11 @@ export default {
         });
       }
       if (path === '/newtab') return html(200, newtabPage());
-
-      /* ---------- مرورگر تصویری (ریموت) ----------
-         سرور صفحه را باز می‌کند، عکس می‌گیرد (سرویس‌های خارجی رایگان + کش)
-         و لینک‌ها را شماره‌گذاری می‌کند؛ کاربر با شماره در همان لینک جلو می‌رود. */
-      {
-        const remoteRes = await remote.handleRemote(path, url);
-        if (remoteRes) return remoteRes;
+      /* ---------- مرورگر تصویری (ریموت) ---------- */
+      if (path === '/remote' || path === '/api/nav' || path === '/shot') {
+        const r = await handleRemote(url);
+        if (r) return r;
       }
-
       if (path === '/health') return new Response('ok', { status: 200, headers: { 'access-control-allow-origin': '*' } });
       /* لایه‌ی Cloudflare نمی‌تواند از پروکسی خروجی استفاده کند؛ پنل «تغییر IP»
          این را می‌بیند و کاربر را به لایه‌ی Node (Railway/Render) راهنمایی می‌کند.
@@ -3129,10 +3128,33 @@ async function proxyFetch(request, targetUrl, ctx, sid) {
   }
   if (!['GET', 'HEAD', 'POST', 'PUT', 'PATCH', 'DELETE'].includes(method)) method = 'GET';
 
+  /* کش کوتاه صفحه (۳۰ ثانیه): باز کردن دوباره‌ی همین صفحه بدون رفت‌وبرگشت به مبدأ و بدون بازنویسی مجدد.
+     فقط صفحات عمومی کش می‌شوند (بدون کوکی شخصی و بدون set-cookie مبدأ). */
+  if (method === 'GET' && CACHE) {
+    try {
+      const hit = await CACHE.match(new Request('https://pxcache.internal/page/' + targetUrl));
+      if (hit) {
+        const h = new Headers();
+        h.set('content-type', 'text/html; charset=utf-8');
+        h.set('cache-control', 'private, max-age=20, stale-while-revalidate=300');
+        h.set('x-robots-tag', 'noindex');
+        h.set('x-px-cache', 'HIT');
+        h.append('set-cookie', SID_COOKIE + '=' + (sid || newSid()) + '; Path=/; HttpOnly; Secure; SameSite=Lax; Max-Age=31536000');
+        const dest = request.headers.get('sec-fetch-dest');
+        const fin = hit.headers.get('x-px-final');
+        if ((!dest || dest === 'document') && fin) {
+          try { h.append('set-cookie', ORIGIN_COOKIE + '=' + encodeURIComponent(new URL(fin).origin) + '; Path=/; HttpOnly; SameSite=Lax; Max-Age=86400'); } catch (_) { }
+        }
+        return new Response(await hit.text(), { status: 200, headers: h });
+      }
+    } catch (_) { /* کش خراب است؛ نادیده گرفته می‌شود */ }
+  }
+
   /* ریدایرکت‌ها دستی دنبال می‌شوند تا «هر پرش» از نظر SSRR بررسی شود —
      قبلاً redirect:'follow' بود و مقصدِ ریدایرکت بدون بررسی می‌ماند. */
   let url = targetUrl;
   let resp = null;
+  let personalized = false; // اگر کوکی سایت مقصد فرستاده شد، صفحه شخصی است و کش نمی‌شود
   for (let hop = 0; hop < 6; hop++) {
     const uu = new URL(url);
     if (isBlockedHost(uu.hostname)) {
@@ -3153,7 +3175,7 @@ async function proxyFetch(request, targetUrl, ctx, sid) {
     if (request.headers.get('if-none-match')) headers['if-none-match'] = request.headers.get('if-none-match');
     // کوکی سایت مقصد از جار «همین نشست» (پشتیبانی ورود — best-effort روی ورکر)
     const jc = jar.cookie(sid, uu.origin);
-    if (jc) headers.cookie = jc;
+    if (jc) { headers.cookie = jc; personalized = true; }
     if (body && method !== 'GET' && method !== 'HEAD') {
       const ct = request.headers.get('content-type');
       if (ct) headers['content-type'] = ct;
@@ -3231,7 +3253,7 @@ async function proxyFetch(request, targetUrl, ctx, sid) {
 
   if (isHtml || isCss) {
     out.set('content-type', isHtml ? 'text/html; charset=utf-8' : 'text/css; charset=utf-8');
-    if (isHtml) out.set('cache-control', 'no-store'); // صفحه داینامیک؛ کش نشود
+    if (isHtml) out.set('cache-control', 'private, max-age=20, stale-while-revalidate=300'); // برگشت/جلو/بازخوانی فوری؛ تازگی ۲۰ ثانیه
     const buf = await resp.arrayBuffer();
     if (buf.byteLength > WORKER_REWRITE_MAX || buf.byteLength > MAX_REWRITE) {
       return new Response(buf, { status: resp.status, headers: out }); // بدون بازنویسی (سقف CPU ورکر)
@@ -3241,6 +3263,18 @@ async function proxyFetch(request, targetUrl, ctx, sid) {
     try { dec = new TextDecoder(cs ? cs[1] : 'utf-8'); } catch (_) { dec = new TextDecoder('utf-8'); }
     let text = dec.decode(buf);
     text = isHtml ? rewriteHtml(text, finalUrl) : rewriteCss(text, finalUrl);
+    // کش کوتاه صفحه (۳۰ث) — فقط صفحات عمومی؛ کلید روی نشانی درخواستی و نهایی (ریدایرکت‌ها)
+    if (isHtml && method === 'GET' && CACHE && resp.status === 200 && !personalized
+      && !resp.headers.get('set-cookie') && text.length <= 768 * 1024 && !/https?:\/\/[^/@]+@/.test(targetUrl)) {
+      const mk = () => new Response(text, {
+        headers: { 'content-type': 'text/html; charset=utf-8', 'x-px-final': finalUrl },
+      });
+      out.set('x-px-cache', 'MISS');
+      ctx.waitUntil(CACHE.put(new Request('https://pxcache.internal/page/' + targetUrl), mk()).catch(() => {}));
+      if (finalUrl !== targetUrl) {
+        ctx.waitUntil(CACHE.put(new Request('https://pxcache.internal/page/' + finalUrl), mk()).catch(() => {}));
+      }
+    }
     return new Response(text, { status: resp.status, headers: out });
   }
 

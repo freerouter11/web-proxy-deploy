@@ -387,10 +387,12 @@ export function remotePage() {
 
 /**
  * هندلر مشترک؛ اگر مسیر مالِ ما نبود null برمی‌گرداند.
- * @param {string} path مسیر decode شده (مثل /remote)
- * @param {URL} url شیء URL درخواست
+ * @param {URL} url شیء URL کامل درخواست (path از خودش گرفته می‌شود)
  */
-export async function handleRemote(path, url) {
+export async function handleRemote(url) {
+  // مسیرهای خراب (مثل /%) اینجا هم نباید Exception بدهند — الگوی مشترک worker/server
+  let path;
+  try { path = decodeURI(url.pathname); } catch (_) { path = url.pathname; }
   if (path === '/remote') return remotePage();
 
   if (path === '/api/nav') {

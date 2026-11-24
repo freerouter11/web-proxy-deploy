@@ -458,6 +458,15 @@ function rewriteHtml(htmlText, base) {
       return parts.length ? pre + '"' + parts.join(', ') + '"' : m;
     });
 
+  // بارگذاری تنبل عکس‌ها: عکس‌های بیرون از صحنه فقط هنگام اسکرول دانلود می‌شوند
+  // (صفحه‌های خبری: صدها درخواست و چند مگابایت در بار اول کم می‌شود؛ جز ۳ عکس اول که احتمالاً در بالای صفحه‌اند)
+  let imgSeen = 0;
+  htmlText = htmlText.replace(/<img\b([^>]*)>/gi, (m, attrs) => {
+    imgSeen++;
+    if (imgSeen <= 3 || /\sloading\s*=/i.test(attrs)) return m;
+    return '<img' + attrs + ' loading="lazy" decoding="async">';
+  });
+
   htmlText = htmlText.replace(/url\(\s*(['"]?)([^'")]+)\1\s*\)/gi, (m, _q, raw) => {
     const p = proxiedPath(raw.trim(), base);
     return p ? 'url("' + p + '")' : m;
@@ -1257,14 +1266,6 @@ function navigate(target){
   renderTabs();
   updateNav();
 }
-/* تبِ مرورگر تصویری — مستقیم /remote (بدون پروکسی‌کردن) */
-function openRemoteTab(){
-  newTab(true);
-  active.url='';
-  active.frame.src='/remote';
-  setAddr('');
-  renderTabs();
-}
 function onLoad(t){
   if(t.id!==active.id){renderTabs();return;}
   syncFromFrame(t);
@@ -1369,6 +1370,7 @@ function renderMenu(){
   menuEl.innerHTML=
    '<div class="mi" data-a="newtab">تب جدید<span class="sc">Ctrl+T</span></div>'
   +'<div class="mi" data-a="inc">تب ناشناس</div>'
+  +'<div class="mi" data-a="remote">مرورگر تصویری (ریموت)</div>'
   +'<div class="msep"></div>'
   +'<div class="mi" data-a="history">تاریخچه</div>'
   +'<div class="mi" data-a="bookmarks">نشانک‌ها</div>'
@@ -1377,7 +1379,6 @@ function renderMenu(){
   +'<div class="mi" data-a="zout">کوچک‌نمایی<span class="sc">Ctrl −</span></div>'
   +'<div class="mi" data-a="zreset">بازنشانی بزرگ‌نمایی<span class="sc">Ctrl 0</span></div>'
   +'<div class="msep"></div>'
-  +'<div class="mi" data-a="remote">مرورگر تصویری (ریموت)</div>'
   +'<div class="mi" data-a="settings">تنظیمات و سرورها</div>'
   +'<div class="mi" data-a="ip">تغییر IP خروجی</div>'
   +'<div class="mi" data-a="about">درباره</div>';
@@ -1388,13 +1389,13 @@ menuEl.addEventListener('click',function(e){
   var a=mi.getAttribute('data-a');
   if(a==='newtab')newTab(true);
   else if(a==='inc')newTab(true,true);
+  else if(a==='remote'){newTab(true).frame.src='/remote';}
   else if(a==='history')showHistory();
   else if(a==='bookmarks')showBookmarks();
   else if(a==='find')openFind();
   else if(a==='zin')setZoom(active?active.zoom+0.1:1);
   else if(a==='zout')setZoom(active?active.zoom-0.1:1);
   else if(a==='zreset')setZoom(1);
-  else if(a==='remote')openRemoteTab();
   else if(a==='settings')showSettings();
   else if(a==='ip')showIpPanel();
   else if(a==='about')showAbout();
@@ -1855,7 +1856,7 @@ button:hover{filter:brightness(1.1)}
     <button type="submit">برو</button>
   </form>
   <div class="tiles" id="tiles"></div>
-  <div class="hint">پخش یوتیوب پشتیبانی می‌شود · «مرورگر تصویری» سایت‌ها را عکس‌به‌عکس با شماره‌ی لینک‌ها می‌گشت · با ⭐/☆ نشانک کن · Ctrl+T تب جدید</div>
+  <div class="hint">پخش یوتیوب پشتیبانی می‌شود · با ⭐/☆ نشانک کن · Ctrl+T تب جدید</div>
 </div>
 <script>
 (function(){
@@ -1868,7 +1869,7 @@ var ENGINES={
   yt:function(q){return 'https://www.youtube.com/results?search_query='+encodeURIComponent(q);}
 };
 var TILES=[
-  {t:'مرورگر تصویری',u:'/remote',c:'#7c3aed',i:'▤'},
+  {t:'مرورگر تصویری',u:'/remote',c:'#7c3aed',i:'▣'},
   {t:'یوتیوب',u:'https://www.youtube.com/',c:'#f43f5e',i:'▶'},
   {t:'BBC فارسی',u:'https://www.bbc.com/persian',c:'#b91c1c',i:'B'},
   {t:'ویکی‌پدیا',u:'https://fa.wikipedia.org/',c:'#334155',i:'W'},
@@ -1889,7 +1890,7 @@ for(var i=0;i<TILES.length;i++){
   })(TILES[i]);
 }
 function go(url){
-  if(url.charAt(0)==='/'){location.href=url;return;}
+  if(url.charAt(0)==='/'){location.href=url;return;} // مسیر داخلی مثل مرورگر تصویری
   if(window.parent&&window.parent!==window){
     try{window.parent.postMessage({px:'go',url:url},'*');return;}catch(e){}
   }
