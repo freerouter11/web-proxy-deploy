@@ -1075,12 +1075,16 @@ body{display:flex;flex-direction:column;background:#0b1220;color:#e7edf8;
 #newtab{width:30px;height:30px;border-radius:8px;border:0;background:#131f39;color:#7dd3fc;
   font-size:17px;cursor:pointer;flex:0 0 auto;font-family:inherit}
 #newtab:hover{background:#1a2a4d}
+#newtab:active{transform:scale(.92)}
+.pbtn:active{transform:scale(.97)}
+.mi:active{background:#1c2b4a}
 /* --- نوار ابزار --- */
 #toolbar{display:flex;align-items:center;gap:5px;padding:7px 10px;background:#0b1220;
   border-bottom:1px solid #1b2740;flex-wrap:nowrap}
 .nbtn{width:40px;height:40px;border-radius:10px;border:0;background:transparent;color:#a9bcd9;
   cursor:pointer;font-size:15px;flex:0 0 auto;display:inline-flex;align-items:center;justify-content:center}
 .nbtn:hover{background:#131f39;color:#e7edf8}
+.nbtn:active{background:#1a2947;transform:scale(.94)}
 .nbtn.dis{opacity:.3;cursor:default}
 .nbtn.dis:hover{background:transparent;color:#a9bcd9}
 #addr{flex:1;min-width:80px;padding:11px 16px;border-radius:20px;border:1px solid #24334f;
@@ -1920,11 +1924,13 @@ select{padding:15px 6px;border-radius:26px;border:1px solid #2a3a5c;background:r
 button{padding:15px 26px;border-radius:26px;border:0;background:linear-gradient(135deg,#0ea5e9,#22d3ee);
   color:#04121f;font-size:15px;font-weight:700;cursor:pointer;font-family:inherit}
 button:hover{filter:brightness(1.1)}
+button:active{filter:brightness(.92);transform:scale(.97)}
 .tiles{display:grid;grid-template-columns:repeat(auto-fill,minmax(102px,1fr));gap:12px}
 .tile{display:flex;flex-direction:column;align-items:center;gap:9px;padding:15px 6px;border-radius:14px;
   background:rgba(17,26,46,.7);border:1px solid #1d2a44;cursor:pointer;color:#c7d5ee;font-size:12px;
   font-family:inherit;transition:transform .15s,border-color .15s}
 .tile:hover{transform:translateY(-3px);border-color:#38bdf8;color:#fff}
+.tile:active{transform:scale(.95);border-color:#38bdf8}
 .tile .ic{width:38px;height:38px;border-radius:11px;display:flex;align-items:center;justify-content:center;
   font-size:17px;font-weight:700;color:#fff}
 .hint{margin-top:30px;color:#8195b8;font-size:12px;line-height:2.2}
