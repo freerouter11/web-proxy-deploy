@@ -32,7 +32,6 @@ jobs:
       - name: Keystore (from secrets, or fresh key if fork)
         env:
           KEYSTORE_B64: ${{ secrets.KEYSTORE_B64 }}
-          KS_PASS: ${{ secrets.KS_PASS }}
         run: |
           set -e
           cd android-app
@@ -42,7 +41,7 @@ jobs:
             # fork بدون سیکریت: کلید تازه می‌سازد (امضا با ریلیزهای رسمی فرق دارد)
             keytool -genkeypair -keystore keystore.jks -alias webproxy \
               -keyalg RSA -keysize 2048 -validity 10000 \
-              -storepass "${KS_PASS:-forkbuild}" -keypass "${KS_PASS:-forkbuild}" \
+              -storepass webproxy2024 -keypass webproxy2024 \
               -dname "CN=Web Proxy Fork, O=Fork"
           fi
 
