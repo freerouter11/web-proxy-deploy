@@ -1,0 +1,11 @@
+# اسرار هرگز به ریپو نمی‌روند
+.env
+*.jks
+keystore.properties
+local.properties
+
+# خروجی ساخت
+android-app/build/
+node_modules/
+*.apk
+!WebProxy.apk

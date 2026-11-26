@@ -1,0 +1,11 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <color name="accent">#38bdf8</color>
+    <color name="banner_offline_bg">#7f1d1d</color>
+    <color name="banner_text">#fee2e2</color>
+    <color name="bg_dark">#0b1220</color>
+    <color name="chip_text">#93c5fd</color>
+    <color name="ic_launcher_background">#0b1220</color>
+    <color name="tb_icon">#93a5c4</color>
+    <color name="toolbar_bg">#0d1730</color>
+</resources>
